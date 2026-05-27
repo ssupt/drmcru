@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a crash, wrong result, or broken workflow.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact action sequence and selected monitor/mode.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: drmcru version or commit
+      placeholder: "0.1.0 or commit hash"
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: Distro, kernel, GPU/driver, connector, compositor, bootloader, initramfs/UKI tool.
+      value: |
+        Distro:
+        Kernel:
+        GPU/driver:
+        Connector:
+        Compositor/session:
+        Bootloader:
+        Initramfs/UKI tool:
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: drmcru doctor output
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+    validations:
+      required: false

@@ -1,0 +1,62 @@
+name: Hardware report
+description: Report whether drmcru worked on a specific monitor/GPU/boot setup.
+title: "[hardware] "
+labels: ["hardware"]
+body:
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Worked
+        - Partially worked
+        - Did not work
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      value: |
+        Distro:
+        Kernel:
+        GPU/driver:
+        Connector:
+        Monitor model:
+        Compositor/session:
+        Bootloader:
+        Initramfs/UKI tool:
+    validations:
+      required: true
+  - type: textarea
+    id: mode
+    attributes:
+      label: Mode tested
+      description: Resolution, refresh rate, timing preset/manual values, and whether it was copied from an existing DTD.
+      placeholder: "Example: 1280x1080@239.76, copied from existing CTA DTD and edited manually"
+    validations:
+      required: true
+  - type: checkboxes
+    id: workflow
+    attributes:
+      label: Workflow results
+      options:
+        - label: Export succeeded
+        - label: Install/Update succeeded
+        - label: Reboot exposed the mode
+        - label: Switch selected the mode
+        - label: Hyprland reload kept the mode
+        - label: Uninstall succeeded
+  - type: textarea
+    id: doctor
+    attributes:
+      label: drmcru doctor output
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+    validations:
+      required: false

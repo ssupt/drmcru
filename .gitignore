@@ -1,0 +1,9 @@
+.codex
+/target
+/dist
+hyprcru_custom_*.bin
+hyprcru_custom_*_instructions.txt
+drmcru_custom_*.bin
+drmcru_custom_*_instructions.txt
+*.hyprcru.*.bak
+*.drmcru.*.bak

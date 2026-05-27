@@ -1,0 +1,28 @@
+[package]
+name = "drmcru"
+version = "0.1.0"
+edition = "2024"
+description = "Linux DRM/KMS custom resolution and EDID override utility"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/ssupt/drmcru"
+keywords = ["drm", "edid", "wayland", "tui"]
+categories = ["command-line-utilities"]
+publish = false
+exclude = [
+    ".codex",
+    "dist",
+    "hyprcru_custom_*.bin",
+    "hyprcru_custom_*_instructions.txt",
+    "drmcru_custom_*.bin",
+    "drmcru_custom_*_instructions.txt",
+    "target",
+]
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

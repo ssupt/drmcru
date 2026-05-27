@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a focused improvement.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or hardware case is not covered?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should drmcru do?
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: Relevant system details
+      description: Distro, compositor, bootloader, GPU/driver, connector, or monitor details if relevant.
+    validations:
+      required: false
