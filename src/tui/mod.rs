@@ -3,7 +3,9 @@ use crate::export::custom_edid_file_name;
 use crate::install::{
     self, InstallError, InstallPlan, InstallReport, InstalledOverrideStatus, UninstallPlan,
 };
-use crate::models::{CtaVideoDescriptor, EdidData, Monitor, TimingDescriptor};
+use crate::models::{
+    CtaVideoDescriptor, DisplayIdDetailedTiming, EdidData, Monitor, TimingDescriptor,
+};
 use crate::timings::{CvtRequest, cvt_reduced_blanking};
 use crate::workspace::{EdidWorkspace, format_location};
 mod actions;
@@ -115,6 +117,7 @@ enum ExtensionRow {
         descriptor: CtaVideoDescriptor,
     },
     Dtd(CtaDtdSlot),
+    DisplayIdDtd(DisplayIdDetailedTiming),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -331,8 +334,15 @@ impl App {
             .working_cta_dtd_slots()
             .into_iter()
             .map(ExtensionRow::Dtd);
+        let displayid_rows = self
+            .selected_edid()
+            .into_iter()
+            .flat_map(|edid| edid.displayid_blocks.iter())
+            .flat_map(|block| block.detailed_timings.iter())
+            .cloned()
+            .map(ExtensionRow::DisplayIdDtd);
 
-        video_rows.chain(dtd_rows).collect()
+        video_rows.chain(dtd_rows).chain(displayid_rows).collect()
     }
 
     fn mode_provenance_map(&self) -> BTreeMap<ModeKey, Vec<String>> {
@@ -392,6 +402,18 @@ impl App {
                             &mut map,
                             key,
                             format!("CTA ext {} DTD slot {}", row.extension_index, row.slot),
+                        );
+                    }
+                }
+                ExtensionRow::DisplayIdDtd(row) => {
+                    if let Some(key) = ModeKey::from_timing(&row.timing) {
+                        push_mode_source(
+                            &mut map,
+                            key,
+                            format!(
+                                "DisplayID ext {} Type I DTD {}",
+                                row.extension_index, row.descriptor_index
+                            ),
                         );
                     }
                 }

@@ -71,6 +71,19 @@ fn report_text(
                 edid.extension_blocks,
                 ok_bad(edid.checksum_valid)
             ));
+            let displayid_dtds = edid
+                .displayid_blocks
+                .iter()
+                .map(|block| block.detailed_timings.len())
+                .sum::<usize>();
+            if !edid.cta_blocks.is_empty() || !edid.displayid_blocks.is_empty() {
+                lines.push(format!(
+                    "   EDID extensions: CTA {} block(s), DisplayID {} block(s), DisplayID DTDs {}",
+                    edid.cta_blocks.len(),
+                    edid.displayid_blocks.len(),
+                    displayid_dtds
+                ));
+            }
             lines.push(format!(
                 "   EDID name: {}",
                 edid.monitor_name.as_deref().unwrap_or("(none)")
@@ -117,6 +130,18 @@ fn report_text(
                     "   Hyprland config mode: {}",
                     last.normalized_rule()
                 ));
+                if let Some(hyprland) = &monitor.hyprland
+                    && let Some(requested) = parse_mode_request(&last.mode)
+                    && !hyprland
+                        .available_modes
+                        .iter()
+                        .any(|mode| available_mode_matches_request(mode, requested))
+                {
+                    lines.push(format!(
+                        "   Hyprland config warning: requested mode {} is not currently exposed",
+                        last.mode
+                    ));
+                }
             }
         }
         for warning in config.read_warnings.iter().take(3) {
@@ -141,6 +166,24 @@ fn inspect_connector_override(connector: &str) -> InstalledOverrideStatus {
         edid_file_name,
     };
     install::inspect_installed_override(&plan)
+}
+
+fn parse_mode_request(mode: &str) -> Option<(u32, u32, f64)> {
+    let (size, refresh) = mode.trim().split_once('@')?;
+    let (width, height) = size.split_once('x')?;
+    let refresh = refresh.trim_end_matches(['H', 'h', 'Z', 'z']);
+    Some((
+        width.parse().ok()?,
+        height.parse().ok()?,
+        refresh.parse().ok()?,
+    ))
+}
+
+fn available_mode_matches_request(mode: &str, requested: (u32, u32, f64)) -> bool {
+    let Some((width, height, refresh_hz)) = parse_mode_request(mode) else {
+        return false;
+    };
+    width == requested.0 && height == requested.1 && (refresh_hz - requested.2).abs() < 0.02
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -205,6 +248,7 @@ mod tests {
                 standard_timings: Vec::new(),
                 detailed_timings: Vec::new(),
                 cta_blocks: Vec::new(),
+                displayid_blocks: Vec::new(),
                 extension_blocks: 0,
                 checksum_valid: true,
             }),
@@ -217,5 +261,17 @@ mod tests {
         assert!(report.contains("EDID name: Test Monitor"));
         assert!(report.contains("Override: active"));
         assert!(report.contains("Override EDID match:"));
+    }
+
+    #[test]
+    fn available_mode_matching_handles_hyprland_suffixes() {
+        assert!(available_mode_matches_request(
+            "2560x1440@165.00Hz",
+            (2560, 1440, 165.0)
+        ));
+        assert!(!available_mode_matches_request(
+            "2560x1440@60.00Hz",
+            (2560, 1440, 90.0)
+        ));
     }
 }

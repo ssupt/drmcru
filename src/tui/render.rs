@@ -348,6 +348,35 @@ impl App {
                 );
                 y = y.saturating_add(1);
             }
+            for displayid in edid.displayid_blocks.clone().iter() {
+                if y >= area.y.saturating_add(area.height) {
+                    return;
+                }
+                let rect = Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                };
+                let text = format!(
+                    "DisplayID ext {} v{}.{}  data {}  DTDs {}  checksum {}",
+                    displayid.extension_index,
+                    displayid.version_major,
+                    displayid.version_minor,
+                    displayid_data_block_summary(displayid),
+                    displayid.detailed_timings.len(),
+                    if displayid.checksum_valid {
+                        "ok"
+                    } else {
+                        "bad"
+                    }
+                );
+                frame.render_widget(
+                    Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
+                    rect,
+                );
+                y = y.saturating_add(1);
+            }
         }
 
         let rows = self.working_extension_rows();
@@ -420,6 +449,20 @@ impl App {
                             row.slot,
                             payload,
                             if row.checksum_valid { "ok" } else { "bad" },
+                            suffix
+                        )
+                    }
+                    ExtensionRow::DisplayIdDtd(row) => {
+                        let suffix = ModeKey::from_timing(&row.timing)
+                            .map(|key| self.provenance_suffix(key))
+                            .unwrap_or_default();
+                        format!(
+                            "{}   DisplayID ext {} DTD {}  {:<18}{}{}",
+                            if selected { ">" } else { " " },
+                            row.extension_index,
+                            row.descriptor_index,
+                            row.timing.hyprland_mode(),
+                            if row.preferred { " preferred" } else { "" },
                             suffix
                         )
                     }
@@ -1179,6 +1222,23 @@ fn cta_data_block_summary(cta: &crate::models::Cta861Block) -> String {
         .collect::<Vec<_>>();
     if cta.data_blocks.len() > labels.len() {
         labels.push(format!("+{}", cta.data_blocks.len() - labels.len()));
+    }
+    labels.join(", ")
+}
+
+fn displayid_data_block_summary(displayid: &crate::models::DisplayIdBlock) -> String {
+    if displayid.data_blocks.is_empty() {
+        return "none".to_string();
+    }
+
+    let mut labels = displayid
+        .data_blocks
+        .iter()
+        .take(4)
+        .map(|block| format!("{}({})", block.label(), block.payload_len))
+        .collect::<Vec<_>>();
+    if displayid.data_blocks.len() > labels.len() {
+        labels.push(format!("+{}", displayid.data_blocks.len() - labels.len()));
     }
     labels.join(", ")
 }

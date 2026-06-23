@@ -171,6 +171,8 @@ impl App {
                     edid.manufacturer_id.as_deref().unwrap_or("(unknown)")
                 ),
                 format!("Extension blocks: {}", edid.extension_blocks),
+                format!("CTA blocks: {}", edid.cta_blocks.len()),
+                format!("DisplayID blocks: {}", edid.displayid_blocks.len()),
                 format!("Base checksum: {}", checksum_label(edid.checksum_valid)),
             ]);
         }
@@ -332,6 +334,25 @@ impl App {
                 };
                 Some(DetailsDialog::new("CTA DTD Slot Details", lines))
             }
+            ExtensionRow::DisplayIdDtd(row) => {
+                let mut lines = timing_detail_lines(
+                    "Source: DisplayID Type I Detailed Timing",
+                    Some(format!(
+                        "DisplayID extension {} data block {} DTD {}",
+                        row.extension_index, row.data_block_index, row.descriptor_index
+                    )),
+                    &row.timing,
+                );
+                lines.extend([
+                    format!("Preferred: {}", yes_no(row.preferred)),
+                    format!("Raw flags: 0x{:02x}", row.raw_flags),
+                    "Editable: no; copy it into a new detailed timing to edit.".to_string(),
+                ]);
+                if let Some(key) = ModeKey::from_timing(&row.timing) {
+                    lines = with_provenance_lines(lines, self.mode_provenance(key));
+                }
+                Some(DetailsDialog::new("DisplayID DTD Details", lines))
+            }
         }
     }
 
@@ -400,6 +421,12 @@ impl App {
             Some(ExtensionRow::Dtd(row)) if row.timing.is_some() => {
                 self.edit_selected_extension_dtd();
             }
+            Some(ExtensionRow::DisplayIdDtd(row)) => {
+                self.status = format!(
+                    "{} is a read-only DisplayID detailed timing. Press s to switch if Hyprland exposes it, or c to copy it.",
+                    row.timing.hyprland_mode()
+                );
+            }
             _ => self.open_extension_add_editor(),
         }
     }
@@ -442,23 +469,35 @@ impl App {
     }
 
     pub(super) fn copy_selected_extension_dtd(&mut self) {
-        let Some(row) = self.selected_extension_slot() else {
-            self.status = "Select a CTA DTD before Copy.".to_string();
-            return;
-        };
-        let Some(timing) = row.timing else {
-            self.status = "Selected CTA DTD slot is empty.".to_string();
-            return;
-        };
-
-        self.detailed_clipboard = Some(timing.clone());
-        self.draft_timing = timing.clone();
-        self.status = format!(
-            "Copied CTA extension {} slot {}: {}.",
-            row.extension_index,
-            row.slot,
-            timing.hyprland_mode()
-        );
+        match self.selected_extension_row() {
+            Some(ExtensionRow::Dtd(row)) => {
+                let Some(timing) = row.timing else {
+                    self.status = "Selected CTA DTD slot is empty.".to_string();
+                    return;
+                };
+                self.detailed_clipboard = Some(timing.clone());
+                self.draft_timing = timing.clone();
+                self.status = format!(
+                    "Copied CTA extension {} slot {}: {}.",
+                    row.extension_index,
+                    row.slot,
+                    timing.hyprland_mode()
+                );
+            }
+            Some(ExtensionRow::DisplayIdDtd(row)) => {
+                self.detailed_clipboard = Some(row.timing.clone());
+                self.draft_timing = row.timing.clone();
+                self.status = format!(
+                    "Copied DisplayID extension {} DTD {}: {}.",
+                    row.extension_index,
+                    row.descriptor_index,
+                    row.timing.hyprland_mode()
+                );
+            }
+            _ => {
+                self.status = "Select a detailed timing row before Copy.".to_string();
+            }
+        }
     }
 
     pub(super) fn delete_selected_detailed(&mut self) {
@@ -1026,6 +1065,7 @@ impl App {
         match self.selected_extension_row()? {
             ExtensionRow::Dtd(row) => Some(row),
             ExtensionRow::Video { .. } => None,
+            ExtensionRow::DisplayIdDtd(_) => None,
         }
     }
 
@@ -1130,6 +1170,14 @@ impl App {
                     source: "CTA detailed timing",
                 })
             }
+            ExtensionRow::DisplayIdDtd(row) => Some(SwitchModeCandidate {
+                request: ModeRequest::new(
+                    u32::from(row.timing.h_active),
+                    u32::from(row.timing.v_active),
+                    row.timing.refresh_hz()?,
+                ),
+                source: "DisplayID detailed timing",
+            }),
         }
     }
 

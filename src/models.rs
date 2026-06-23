@@ -67,6 +67,7 @@ pub struct EdidData {
     pub standard_timings: Vec<StandardTiming>,
     pub detailed_timings: Vec<TimingDescriptor>,
     pub cta_blocks: Vec<Cta861Block>,
+    pub displayid_blocks: Vec<DisplayIdBlock>,
     pub extension_blocks: u8,
     pub checksum_valid: bool,
 }
@@ -80,6 +81,50 @@ pub struct Cta861Block {
     pub data_blocks: Vec<CtaDataBlock>,
     pub detailed_timings: Vec<TimingDescriptor>,
     pub available_dtd_slots: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayIdBlock {
+    pub extension_index: u8,
+    pub version_major: u8,
+    pub version_minor: u8,
+    pub product_type: u8,
+    pub extension_count: u8,
+    pub checksum_valid: bool,
+    pub data_blocks: Vec<DisplayIdDataBlock>,
+    pub detailed_timings: Vec<DisplayIdDetailedTiming>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayIdDataBlock {
+    pub tag: u8,
+    pub revision: u8,
+    pub payload_len: usize,
+}
+
+impl DisplayIdDataBlock {
+    pub fn label(&self) -> String {
+        match self.tag {
+            0x03 => "Type I timings".to_string(),
+            0x04 => "Type II timings".to_string(),
+            0x05 => "Type III timings".to_string(),
+            0x12 => "Tiled display".to_string(),
+            0x20 => "Product ID".to_string(),
+            0x21 => "Display parameters".to_string(),
+            0x22 => "Color characteristics".to_string(),
+            tag => format!("DisplayID tag 0x{tag:02x}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayIdDetailedTiming {
+    pub extension_index: u8,
+    pub data_block_index: usize,
+    pub descriptor_index: usize,
+    pub raw_flags: u8,
+    pub preferred: bool,
+    pub timing: TimingDescriptor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

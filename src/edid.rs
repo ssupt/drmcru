@@ -1,6 +1,7 @@
 use crate::models::{
-    Cta861Block, CtaDataBlock, CtaVideoDescriptor, CtaVideoMode, EdidData, EstablishedTiming,
-    StandardTiming, StandardTimingAspect, TimingDescriptor,
+    Cta861Block, CtaDataBlock, CtaVideoDescriptor, CtaVideoMode, DisplayIdBlock,
+    DisplayIdDataBlock, DisplayIdDetailedTiming, EdidData, EstablishedTiming, StandardTiming,
+    StandardTimingAspect, TimingDescriptor,
 };
 use thiserror::Error;
 
@@ -36,7 +37,11 @@ const STANDARD_TIMING_START: usize = 38;
 const STANDARD_TIMING_LEN: usize = 2;
 const STANDARD_TIMING_SLOTS: usize = 8;
 const CTA_TAG: u8 = 0x02;
+const DISPLAYID_TAG: u8 = 0x70;
 const CTA_HEADER_LEN: usize = 4;
+const DISPLAYID_HEADER_LEN: usize = 5;
+const DISPLAYID_DATA_BLOCK_HEADER_LEN: usize = 3;
+const DISPLAYID_TYPE_I_DTD_LEN: usize = 20;
 const BLOCK_CHECKSUM_INDEX: usize = 127;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +121,7 @@ pub fn parse_edid(raw: Vec<u8>) -> Result<EdidData, EdidError> {
         }
     }
     let cta_blocks = parse_cta_blocks(&raw, extension_blocks);
+    let displayid_blocks = parse_displayid_blocks(&raw, extension_blocks);
 
     Ok(EdidData {
         raw,
@@ -128,6 +134,7 @@ pub fn parse_edid(raw: Vec<u8>) -> Result<EdidData, EdidError> {
         standard_timings,
         detailed_timings,
         cta_blocks,
+        displayid_blocks,
         extension_blocks,
         checksum_valid,
     })
@@ -585,6 +592,14 @@ fn low_byte(value: u16) -> u8 {
     value as u8
 }
 
+fn le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn le_u24(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
+}
+
 fn low_nibble(value: u16) -> u8 {
     (value as u8) & 0x0f
 }
@@ -605,6 +620,154 @@ fn parse_cta_blocks(raw: &[u8], extension_blocks: u8) -> Vec<Cta861Block> {
             parse_cta_block(extension_index, &raw[block_start..block_end])
         })
         .collect()
+}
+
+fn parse_displayid_blocks(raw: &[u8], extension_blocks: u8) -> Vec<DisplayIdBlock> {
+    (1..=extension_blocks)
+        .filter_map(|extension_index| {
+            let block_start = usize::from(extension_index) * EDID_BLOCK_LEN;
+            let block_end = block_start + EDID_BLOCK_LEN;
+            if block_end > raw.len() {
+                return None;
+            }
+
+            parse_displayid_block(extension_index, &raw[block_start..block_end])
+        })
+        .collect()
+}
+
+fn parse_displayid_block(extension_index: u8, block: &[u8]) -> Option<DisplayIdBlock> {
+    if block.len() != EDID_BLOCK_LEN || block.first().copied() != Some(DISPLAYID_TAG) {
+        return None;
+    }
+
+    let version = block[1];
+    let version_major = version >> 4;
+    let version_minor = version & 0x0f;
+    let payload_len = usize::from(block[2]).min(BLOCK_CHECKSUM_INDEX - DISPLAYID_HEADER_LEN);
+    let product_type = block[3];
+    let extension_count = block[4];
+    let payload_end = DISPLAYID_HEADER_LEN + payload_len;
+
+    let mut data_blocks = Vec::new();
+    let mut detailed_timings = Vec::new();
+    let mut offset = DISPLAYID_HEADER_LEN;
+    let mut data_block_index = 0;
+    while offset + DISPLAYID_DATA_BLOCK_HEADER_LEN <= payload_end {
+        let tag = block[offset];
+        if tag == 0 {
+            break;
+        }
+        let revision = block[offset + 1];
+        let block_payload_len = usize::from(block[offset + 2]);
+        let payload_start = offset + DISPLAYID_DATA_BLOCK_HEADER_LEN;
+        let payload_end = payload_start + block_payload_len;
+        if payload_end > block.len().saturating_sub(1)
+            || payload_end > DISPLAYID_HEADER_LEN + payload_len
+        {
+            break;
+        }
+
+        let payload = &block[payload_start..payload_end];
+        data_blocks.push(DisplayIdDataBlock {
+            tag,
+            revision,
+            payload_len: block_payload_len,
+        });
+        if tag == 0x03 {
+            detailed_timings.extend(parse_displayid_type_i_dtds(
+                extension_index,
+                data_block_index,
+                payload,
+            ));
+        }
+
+        data_block_index += 1;
+        offset = payload_end;
+    }
+
+    Some(DisplayIdBlock {
+        extension_index,
+        version_major,
+        version_minor,
+        product_type,
+        extension_count,
+        checksum_valid: block_checksum_valid(block),
+        data_blocks,
+        detailed_timings,
+    })
+}
+
+fn parse_displayid_type_i_dtds(
+    extension_index: u8,
+    data_block_index: usize,
+    payload: &[u8],
+) -> Vec<DisplayIdDetailedTiming> {
+    payload
+        .chunks_exact(DISPLAYID_TYPE_I_DTD_LEN)
+        .enumerate()
+        .filter_map(|(descriptor_index, descriptor)| {
+            parse_displayid_type_i_dtd(
+                extension_index,
+                data_block_index,
+                descriptor_index,
+                descriptor,
+            )
+        })
+        .collect()
+}
+
+fn parse_displayid_type_i_dtd(
+    extension_index: u8,
+    data_block_index: usize,
+    descriptor_index: usize,
+    descriptor: &[u8],
+) -> Option<DisplayIdDetailedTiming> {
+    if descriptor.len() != DISPLAYID_TYPE_I_DTD_LEN {
+        return None;
+    }
+
+    let pixel_clock_khz = (le_u24(&descriptor[0..3]) + 1) * 10;
+    let raw_flags = descriptor[3];
+    let h_active = le_u16(&descriptor[4..6]).checked_add(1)?;
+    let h_blanking = le_u16(&descriptor[6..8]).checked_add(1)?;
+    let h_front_porch = le_u16(&descriptor[8..10]).checked_add(1)?;
+    let h_sync_width = le_u16(&descriptor[10..12]).checked_add(1)?;
+    let v_active = le_u16(&descriptor[12..14]).checked_add(1)?;
+    let v_blanking = le_u16(&descriptor[14..16]).checked_add(1)?;
+    let v_front_porch = le_u16(&descriptor[16..18]).checked_add(1)?;
+    let v_sync_width = le_u16(&descriptor[18..20]).checked_add(1)?;
+
+    let h_back_porch = h_blanking
+        .checked_sub(h_front_porch)?
+        .checked_sub(h_sync_width)?;
+    let v_back_porch = v_blanking
+        .checked_sub(v_front_porch)?
+        .checked_sub(v_sync_width)?;
+
+    Some(DisplayIdDetailedTiming {
+        extension_index,
+        data_block_index,
+        descriptor_index,
+        raw_flags,
+        preferred: raw_flags & 0x80 != 0,
+        timing: TimingDescriptor {
+            pixel_clock_khz,
+            h_active,
+            h_blanking,
+            h_front_porch,
+            h_sync_width,
+            h_back_porch,
+            v_active,
+            v_blanking,
+            v_front_porch,
+            v_sync_width,
+            v_back_porch,
+            h_sync_positive: false,
+            v_sync_positive: false,
+            interlaced: raw_flags & 0x10 != 0,
+        },
+    })
 }
 
 fn parse_cta_block(extension_index: u8, block: &[u8]) -> Option<Cta861Block> {
@@ -1172,6 +1335,41 @@ mod tests {
         };
         assert_eq!(mode.vic, 16);
         assert_eq!(mode.width, 1920);
+    }
+
+    #[test]
+    fn parses_displayid_type_i_detailed_timings() {
+        let mut edid = minimal_base_edid(1);
+        let mut displayid = vec![0u8; 128];
+        displayid[0] = DISPLAYID_TAG;
+        displayid[1] = 0x13;
+        displayid[2] = 121;
+        displayid[3] = 0;
+        displayid[4] = 0;
+        displayid[5] = 0x03;
+        displayid[6] = 0x01;
+        displayid[7] = DISPLAYID_TYPE_I_DTD_LEN as u8;
+        displayid[8..28].copy_from_slice(&[
+            0x19, 0x13, 0x01, 0x84, 0xff, 0x09, 0xaf, 0x00, 0x2f, 0x00, 0x1f, 0x00, 0x9f, 0x05,
+            0x77, 0x00, 0x02, 0x00, 0x05, 0x00,
+        ]);
+        repair_block_checksum(&mut displayid);
+        edid.extend(displayid);
+
+        let parsed = parse_edid(edid).expect("parse EDID");
+        assert_eq!(parsed.displayid_blocks.len(), 1);
+        let block = &parsed.displayid_blocks[0];
+        assert_eq!(block.version_major, 1);
+        assert_eq!(block.version_minor, 3);
+        assert_eq!(block.data_blocks[0].label(), "Type I timings");
+        assert_eq!(block.detailed_timings.len(), 1);
+
+        let row = &block.detailed_timings[0];
+        assert!(row.preferred);
+        assert_eq!(row.timing.h_active, 2560);
+        assert_eq!(row.timing.v_active, 1440);
+        assert_eq!(row.timing.pixel_clock_khz, 704_260);
+        assert!((row.timing.refresh_hz().unwrap() - 165.003).abs() < 0.01);
     }
 
     #[test]
