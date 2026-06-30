@@ -303,7 +303,31 @@ pub fn insert_detailed_timing(
         ));
     }
 
-    Err(EdidError::NoAvailableDetailedTimingSlot)
+    let Some(extension_index) = extension_blocks.checked_add(1) else {
+        return Err(EdidError::NoAvailableDetailedTimingSlot);
+    };
+    let block_start = usize::from(extension_index) * EDID_BLOCK_LEN;
+    if block_start > patched.len() {
+        return Err(EdidError::TooShort(block_start));
+    }
+
+    let mut cta = [0u8; EDID_BLOCK_LEN];
+    cta[0] = CTA_TAG;
+    cta[1] = 3;
+    cta[2] = CTA_HEADER_LEN as u8;
+    cta[CTA_HEADER_LEN..CTA_HEADER_LEN + DTD_LEN].copy_from_slice(&descriptor);
+    repair_block_checksum(&mut cta);
+    patched.splice(block_start..block_start, cta);
+    patched[126] = extension_index;
+    repair_block_checksum(&mut patched[..BASE_BLOCK_LEN]);
+
+    Ok((
+        patched,
+        DtdLocation::Cta {
+            extension_index,
+            slot: 0,
+        },
+    ))
 }
 
 pub fn insert_cta_detailed_timing(
@@ -1462,6 +1486,44 @@ mod tests {
         let parsed = parse_edid(patched).expect("patched EDID should parse");
         assert_eq!(parsed.cta_blocks.len(), 1);
         assert_eq!(parsed.cta_blocks[0].detailed_timings.first(), Some(&timing));
+    }
+
+    #[test]
+    fn insert_appends_cta_after_displayid_when_no_dtd_slot_is_free() {
+        let timing = sample_timing();
+        let mut edid = minimal_base_edid(1);
+        for slot in 0..DTD_SLOTS {
+            edid = patch_base_detailed_timing(&edid, slot, &timing).expect("patch base DTD");
+        }
+
+        let mut displayid = vec![0u8; EDID_BLOCK_LEN];
+        displayid[0] = DISPLAYID_TAG;
+        displayid[1] = 0x13;
+        repair_block_checksum(&mut displayid);
+        edid.extend_from_slice(&displayid);
+
+        let (patched, location) = insert_detailed_timing(&edid, &timing).expect("append CTA DTD");
+
+        assert_eq!(
+            location,
+            DtdLocation::Cta {
+                extension_index: 2,
+                slot: 0
+            }
+        );
+        assert_eq!(patched[126], 2);
+        assert_eq!(&patched[128..256], displayid.as_slice());
+        assert!(
+            patched
+                .chunks_exact(EDID_BLOCK_LEN)
+                .all(block_checksum_valid)
+        );
+
+        let parsed = parse_edid(patched).expect("parse expanded EDID");
+        assert_eq!(parsed.displayid_blocks.len(), 1);
+        assert_eq!(parsed.cta_blocks.len(), 1);
+        assert_eq!(parsed.cta_blocks[0].detailed_timings, vec![timing]);
+        assert_eq!(parsed.cta_blocks[0].available_dtd_slots, 5);
     }
 
     #[test]
