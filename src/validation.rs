@@ -139,6 +139,33 @@ pub fn validate_timing(timing: &TimingDescriptor) -> Vec<TimingWarning> {
     warnings
 }
 
+pub fn internal_panel_scaling_warning(
+    connector: &str,
+    native: &TimingDescriptor,
+    timings: &[TimingDescriptor],
+) -> Option<TimingWarning> {
+    if !connector.starts_with("eDP-") {
+        return None;
+    }
+
+    let mut sizes = timings
+        .iter()
+        .filter(|timing| timing.h_active != native.h_active || timing.v_active != native.v_active)
+        .map(|timing| format!("{}x{}", timing.h_active, timing.v_active))
+        .collect::<Vec<_>>();
+    sizes.sort();
+    sizes.dedup();
+
+    (!sizes.is_empty()).then(|| {
+        TimingWarning::warning(format!(
+            "internal panel modes {} differ from native {}x{}; many eDP panels cannot scale smaller scanouts and may tile or corrupt the image. Keep the native active size and change only the refresh timing",
+            sizes.join(", "),
+            native.h_active,
+            native.v_active
+        ))
+    })
+}
+
 fn validate_12_bit(warnings: &mut Vec<TimingWarning>, label: &str, value: u16) {
     validate_limit(warnings, label, u32::from(value), 0x0fff);
 }
@@ -189,6 +216,21 @@ mod tests {
     #[test]
     fn valid_timing_has_no_warnings() {
         assert!(validate_timing(&valid_timing()).is_empty());
+    }
+
+    #[test]
+    fn warns_about_non_native_internal_panel_modes() {
+        let native = valid_timing();
+        let mut smaller = native.clone();
+        smaller.h_active = 1280;
+        smaller.v_active = 720;
+
+        assert!(
+            internal_panel_scaling_warning("eDP-1", &native, std::slice::from_ref(&native))
+                .is_none()
+        );
+        assert!(internal_panel_scaling_warning("DP-1", &native, &[smaller.clone()]).is_none());
+        assert!(internal_panel_scaling_warning("eDP-1", &native, &[smaller]).is_some());
     }
 
     #[test]

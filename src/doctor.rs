@@ -3,6 +3,7 @@ use crate::export::custom_edid_file_name;
 use crate::hyprland_config;
 use crate::install::{self, InstalledOverrideStatus, SystemSupportReport, UninstallPlan};
 use crate::models::Monitor;
+use crate::validation::internal_panel_scaling_warning;
 use anyhow::Result;
 
 pub fn run() -> Result<()> {
@@ -88,6 +89,23 @@ fn report_text(
                 "   EDID name: {}",
                 edid.monitor_name.as_deref().unwrap_or("(none)")
             ));
+            if let Some(native) = edid.detailed_timings.first() {
+                let timings = edid
+                    .detailed_timings
+                    .iter()
+                    .chain(
+                        edid.cta_blocks
+                            .iter()
+                            .flat_map(|block| block.detailed_timings.iter()),
+                    )
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(warning) =
+                    internal_panel_scaling_warning(&monitor.connector, native, &timings)
+                {
+                    lines.push(format!("   EDID warning: {}", warning.message));
+                }
+            }
         } else {
             lines.push("   EDID: unavailable".to_string());
         }

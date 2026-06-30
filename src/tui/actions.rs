@@ -10,7 +10,7 @@ use crate::hyprland::{self, ModeRequest};
 use crate::hyprland_config::{self, MonitorRuleInspection};
 use crate::install::{self, InstallPlan, InstallPreview, UninstallPlan, UninstallPreview};
 use crate::models::{CtaVideoDescriptor, StandardTiming, StandardTimingAspect};
-use crate::validation::validate_timing;
+use crate::validation::{internal_panel_scaling_warning, validate_timing};
 use crate::workspace::{EdidWorkspace, MoveDirection, format_location};
 use std::fs;
 use std::path::PathBuf;
@@ -1020,6 +1020,9 @@ impl App {
                 .into_iter()
                 .map(|warning| format!("Draft timing {}: {}", warning.label(), warning.message)),
         );
+        if let Some(warning) = self.internal_panel_timing_warning() {
+            issues.push(format!("Panel warning: {}", warning.message));
+        }
 
         if let Some(key) = ModeKey::from_timing(&self.draft_timing) {
             let provenance = self.mode_provenance(key);
@@ -1047,6 +1050,10 @@ impl App {
             })
             .collect::<Vec<_>>();
 
+        if let Some(warning) = self.internal_panel_timing_warning() {
+            lines.push(format!("Warning:    {}", warning.message));
+        }
+
         if let Some(key) = ModeKey::from_timing(&self.draft_timing) {
             let provenance = self.mode_provenance(key);
             if provenance.sources.len() > 1 {
@@ -1059,6 +1066,22 @@ impl App {
         }
 
         lines
+    }
+
+    fn internal_panel_timing_warning(&self) -> Option<crate::validation::TimingWarning> {
+        let monitor = self.selected_monitor()?;
+        let native = monitor.edid.as_ref()?.detailed_timings.first()?;
+        let timings = match self.selected_workspace() {
+            Some(workspace) if workspace.has_changes() => workspace
+                .dtds()
+                .ok()?
+                .into_iter()
+                .map(|row| row.timing)
+                .collect::<Vec<_>>(),
+            _ => vec![self.draft_timing.clone()],
+        };
+
+        internal_panel_scaling_warning(&monitor.connector, native, &timings)
     }
 
     fn selected_extension_slot(&self) -> Option<crate::edid::CtaDtdSlot> {
