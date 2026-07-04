@@ -2,6 +2,7 @@
 name = "drmcru"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 description = "Linux DRM/KMS custom resolution and EDID override utility"
 readme = "README.md"
 license = "GPL-3.0-or-later"

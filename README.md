@@ -7,24 +7,47 @@ overrides on supported systems so the kernel exposes custom modes after reboot.
 Hyprland integration is included for live mode discovery, switching, verification,
 and generated `monitor=...` rules.
 
+> `drmcru` is an early preview. EDID overrides affect display initialization;
+> keep a known-good mode or another way to access the system available.
+
 ## Status
 
 This release has been tested on:
 
-- Hyprland
-- Limine
-- `limine-mkinitcpio`
-- external DisplayPort monitor
+- Hyprland with NVIDIA DRM
+- external DisplayPort and internal eDP discovery
+- Limine with `limine-mkinitcpio`
 
 Exported EDIDs can be installed manually on other setups. Automatic
 Install/Update/Uninstall is currently limited to Limine systems that rebuild with
 `limine-mkinitcpio` or mkinitcpio presets.
 
-Use known-good timings and keep a fallback display path available.
+## Install
 
-## Build
+Download the portable x86-64 binary from the
+[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.0):
 
 ```sh
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.0/drmcru-0.1.0-x86_64-unknown-linux-musl
+chmod +x drmcru-0.1.0-x86_64-unknown-linux-musl
+./drmcru-0.1.0-x86_64-unknown-linux-musl doctor
+./drmcru-0.1.0-x86_64-unknown-linux-musl
+```
+
+The TUI and manual Export work on Linux systems that expose connectors through
+`/sys/class/drm`. Hyprland is optional, but `hyprctl` is required for live mode
+discovery, switching, and verification.
+
+Automatic Install/Update/Uninstall currently requires `pkexec`, Limine,
+mkinitcpio, and either `limine-mkinitcpio` or mkinitcpio presets.
+
+## Build From Source
+
+Rust 1.87 or newer is required.
+
+```sh
+git clone https://github.com/ssupt/drmcru.git
+cd drmcru
 cargo build --release
 ./target/release/drmcru doctor
 ./target/release/drmcru
@@ -59,6 +82,9 @@ new EDID mode appear.
 - Base-block standard timings
 - CTA-861 extension detailed timing descriptors
 
+DisplayID Type I detailed timings are decoded and can be copied into an
+editable EDID DTD. DisplayID blocks themselves are currently read-only.
+
 Detailed timings are the right place for custom modes such as `1280x1080@240`.
 EDID standard timings have fixed aspect-ratio limits and are not suitable for
 arbitrary shapes.
@@ -82,6 +108,17 @@ On the supported Limine/mkinitcpio path, Install/Update modifies:
 - `/etc/limine-entry-tool.d/drmcru-edid.conf` when `limine-mkinitcpio` is used
 
 It writes timestamped `.drmcru.*.bak` backups before editing config files.
+
+## Recovery
+
+If a custom mode is unusable but the desktop remains accessible, switch back
+to a known-good mode, choose Uninstall in `drmcru`, and reboot.
+
+If the graphical session is unusable, boot once without the
+`drm.edid_firmware=...` parameter using the Limine entry editor or another boot
+entry. Then run `drmcru`, choose Uninstall, and reboot. Automatic changes to
+`mkinitcpio.conf` and `limine.conf` have timestamped backups beside the original
+files.
 
 ## Hyprland
 

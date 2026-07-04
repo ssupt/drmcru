@@ -19,25 +19,18 @@ cargo test --locked
 cargo package --allow-dirty --no-verify --offline
 cargo build --release --locked
 
-crate_path="target/package/${pkgname}-${version}.crate"
-source_tarball="${dist_dir}/${pkgname}-${version}.tar.gz"
 binary_path="${dist_dir}/${pkgname}-${version}-${target_triple}"
 checksums="${dist_dir}/SHA256SUMS"
 
-cp "$crate_path" "$source_tarball"
 cp "target/release/${pkgname}" "$binary_path"
 
 (
     cd "$dist_dir"
-    sha256sum \
-        "${pkgname}-${version}.tar.gz" \
-        "${pkgname}-${version}-${target_triple}" \
-        > "SHA256SUMS"
+    sha256sum "${pkgname}-${version}-${target_triple}" > "SHA256SUMS"
 )
 
 cat <<EOF
 Created release artifacts:
-  ${source_tarball}
   ${binary_path}
   ${checksums}
 
