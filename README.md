@@ -10,6 +10,8 @@ and generated `monitor=...` rules.
 > `drmcru` is an early preview. EDID overrides affect display initialization;
 > keep a known-good mode or another way to access the system available.
 
+[![drmcru TUI](assets/drmcru.png)](assets/drmcru.png)
+
 ## Status
 
 This release has been tested on:
