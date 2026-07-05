@@ -51,14 +51,7 @@ pub enum WorkspaceOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationIssue {
-    pub severity: ValidationSeverity,
     pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationSeverity {
-    Warning,
-    Error,
 }
 
 #[derive(Debug, Error)]
@@ -277,7 +270,6 @@ impl EdidWorkspace {
         let mut issues = Vec::new();
         if !self.working.checksum_valid {
             issues.push(ValidationIssue {
-                severity: ValidationSeverity::Error,
                 message: "base EDID checksum is invalid".to_string(),
             });
         }
@@ -285,20 +277,12 @@ impl EdidWorkspace {
         for cta in &self.working.cta_blocks {
             if !cta.checksum_valid {
                 issues.push(ValidationIssue {
-                    severity: ValidationSeverity::Error,
                     message: format!(
                         "CTA-861 extension {} checksum is invalid",
                         cta.extension_index
                     ),
                 });
             }
-        }
-
-        if !self.has_changes() {
-            issues.push(ValidationIssue {
-                severity: ValidationSeverity::Warning,
-                message: "working EDID has no pending changes".to_string(),
-            });
         }
 
         issues
@@ -492,12 +476,14 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Added"))
         );
-        assert!(
-            workspace
-                .validate()
-                .iter()
-                .all(|issue| issue.severity != ValidationSeverity::Error)
-        );
+        assert!(workspace.validate().is_empty());
+    }
+
+    #[test]
+    fn unchanged_valid_workspace_has_no_validation_issues() {
+        let workspace = EdidWorkspace::new(minimal_base_edid(0)).expect("workspace");
+
+        assert!(workspace.validate().is_empty());
     }
 
     #[test]

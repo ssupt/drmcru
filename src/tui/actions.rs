@@ -978,7 +978,7 @@ impl App {
         if exporting_workspace {
             if let Some(workspace) = self.selected_workspace() {
                 for issue in workspace.validate() {
-                    issues.push(format!("{:?}: {}", issue.severity, issue.message));
+                    issues.push(format!("Error: {}", issue.message));
                 }
             }
         } else {

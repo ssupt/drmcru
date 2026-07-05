@@ -486,24 +486,23 @@ impl App {
                     width: area.width,
                     height: 1,
                 };
-                frame.render_widget(
-                    Paragraph::new(format!("{:?}: {}", issue.severity, issue.message)),
-                    rect,
-                );
+                frame.render_widget(Paragraph::new(format!("Error: {}", issue.message)), rect);
                 y = y.saturating_add(1);
             }
-            for line in workspace.diff_summary().into_iter().take(3) {
-                if y >= area.y.saturating_add(area.height) {
-                    return;
+            if workspace.has_changes() {
+                for line in workspace.diff_summary().into_iter().take(3) {
+                    if y >= area.y.saturating_add(area.height) {
+                        return;
+                    }
+                    let rect = Rect {
+                        x: area.x,
+                        y,
+                        width: area.width,
+                        height: 1,
+                    };
+                    frame.render_widget(Paragraph::new(line), rect);
+                    y = y.saturating_add(1);
                 }
-                let rect = Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height: 1,
-                };
-                frame.render_widget(Paragraph::new(line), rect);
-                y = y.saturating_add(1);
             }
         }
     }
