@@ -27,13 +27,13 @@ Install/Update/Uninstall is currently limited to Limine systems that rebuild wit
 ## Install
 
 Download the portable x86-64 binary from the
-[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.0):
+[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.1):
 
 ```sh
-curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.0/drmcru-0.1.0-x86_64-unknown-linux-musl
-chmod +x drmcru-0.1.0-x86_64-unknown-linux-musl
-./drmcru-0.1.0-x86_64-unknown-linux-musl doctor
-./drmcru-0.1.0-x86_64-unknown-linux-musl
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.1/drmcru-0.1.1-x86_64-unknown-linux-musl
+chmod +x drmcru-0.1.1-x86_64-unknown-linux-musl
+./drmcru-0.1.1-x86_64-unknown-linux-musl doctor
+./drmcru-0.1.1-x86_64-unknown-linux-musl
 ```
 
 The TUI and manual Export work on Linux systems that expose connectors through
