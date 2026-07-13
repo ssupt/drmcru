@@ -47,6 +47,10 @@ pub fn validate_timing(timing: &TimingDescriptor) -> Vec<TimingWarning> {
         warnings.push(TimingWarning::error(
             "pixel clock must be greater than zero",
         ));
+    } else if timing.pixel_clock_khz < 10 {
+        warnings.push(TimingWarning::error(
+            "pixel clock must be at least 10 kHz for an EDID DTD",
+        ));
     }
     if timing.pixel_clock_khz > 655_350 {
         warnings.push(TimingWarning::error(format!(

@@ -308,7 +308,8 @@ impl TimingDescriptor {
 pub struct ExportPlan {
     pub connector: String,
     pub edid_file_name: String,
-    pub timing: TimingDescriptor,
+    pub hyprland_mode: String,
+    pub hyprland_rule: String,
     pub position: String,
     pub scale: String,
 }
@@ -322,12 +323,6 @@ impl ExportPlan {
     }
 
     pub fn hyprland_monitor_rule(&self) -> String {
-        format!(
-            "monitor={},{},{},{}",
-            self.connector,
-            self.timing.hyprland_mode(),
-            self.position,
-            self.scale
-        )
+        self.hyprland_rule.clone()
     }
 }

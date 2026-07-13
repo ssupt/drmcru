@@ -183,11 +183,44 @@ fn apply_monitor_argument(argument: &str) -> Result<String, HyprlandError> {
     if output.status.success() {
         Ok(combined)
     } else {
-        Err(HyprlandError::CommandFailed {
-            code: output.status.code().unwrap_or(-1),
-            output: combined,
+        apply_monitor_argument_lua(argument).map_err(|fallback| HyprlandError::CommandFailed {
+            code: fallback.0,
+            output: command_output_text(
+                combined.as_bytes(),
+                format!("Lua fallback: {}", fallback.1).as_bytes(),
+            ),
         })
     }
+}
+
+fn apply_monitor_argument_lua(argument: &str) -> Result<String, (i32, String)> {
+    let mut parts = argument.splitn(4, ',');
+    let (Some(connector), Some(mode), Some(position), Some(scale)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err((-1, "invalid monitor argument".to_string()));
+    };
+    let expression = format!(
+        "hl.monitor({{ output = {}, mode = {}, position = {}, scale = {} }})",
+        lua_string(connector),
+        lua_string(mode),
+        lua_string(position),
+        scale
+    );
+    let output = Command::new("hyprctl")
+        .args(["eval", &expression])
+        .output()
+        .map_err(|error| (-1, error.to_string()))?;
+    let combined = command_output_text(&output.stdout, &output.stderr);
+    if output.status.success() {
+        Ok(combined)
+    } else {
+        Err((output.status.code().unwrap_or(-1), combined))
+    }
+}
+
+fn lua_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
@@ -304,7 +337,12 @@ impl HyprlandMonitorJson {
             .into_iter()
             .flatten()
             .filter_map(|mode| parse_mode(mode))
-            .find(|mode| mode.matches_request(requested))
+            .filter(|mode| mode.matches_request(requested))
+            .min_by(|left, right| {
+                (left.refresh_hz - requested.refresh_hz)
+                    .abs()
+                    .total_cmp(&(right.refresh_hz - requested.refresh_hz).abs())
+            })
             .map(|mode| mode.label())
     }
 }
@@ -361,7 +399,7 @@ fn parse_mode(mode: &str) -> Option<ParsedMode> {
 fn mode_matches_request(width: u32, height: u32, refresh_hz: f64, requested: &ModeRequest) -> bool {
     width == requested.width
         && height == requested.height
-        && (refresh_hz - requested.refresh_hz).abs() <= 1.0
+        && (refresh_hz - requested.refresh_hz).abs() <= 0.5
 }
 
 fn format_float(value: f64) -> String {
@@ -476,6 +514,20 @@ mod tests {
     }
 
     #[test]
+    fn available_mode_label_chooses_closest_refresh() {
+        let mut monitor = sample_live_monitor();
+        monitor.available_modes = Some(vec![
+            "1280x1080@239.60Hz".to_string(),
+            "1280x1080@239.94Hz".to_string(),
+        ]);
+
+        assert_eq!(
+            monitor.mode_label_for_request(&ModeRequest::new(1280, 1080, 240.0)),
+            Some("1280x1080@239.94".to_string())
+        );
+    }
+
+    #[test]
     fn mode_inspection_reports_availability_and_active_match() {
         let requested = ModeRequest::new(1920, 1080, 144.0);
         let monitor = sample_live_monitor();
@@ -504,6 +556,16 @@ mod tests {
             1080,
             143.8,
             &ModeRequest::new(1920, 1080, 144.0)
+        ));
+    }
+
+    #[test]
+    fn actual_mode_match_rejects_a_whole_hertz_difference() {
+        assert!(!mode_matches_request(
+            1920,
+            1080,
+            59.0,
+            &ModeRequest::new(1920, 1080, 60.0)
         ));
     }
 

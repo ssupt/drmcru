@@ -26,17 +26,28 @@ impl App {
 
         self.draw_monitor_selector(frame, top_bar);
 
-        let [left_column, right_column] =
-            Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
-                .areas(main_area);
-        self.draw_established_panel(frame, left_column);
-
-        let [detailed, standard, extension] = Layout::vertical([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-        ])
-        .areas(right_column);
+        let (established, detailed, standard, extension) = if main_area.width >= 100 {
+            let [left_column, right_column] =
+                Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+                    .areas(main_area);
+            let [detailed, standard, extension] = Layout::vertical([
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+            ])
+            .areas(right_column);
+            (left_column, detailed, standard, extension)
+        } else {
+            let [established, detailed, standard, extension] = Layout::vertical([
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+            ])
+            .areas(main_area);
+            (established, detailed, standard, extension)
+        };
+        self.draw_established_panel(frame, established);
         self.draw_resolution_section(frame, detailed, ResolutionSection::Detailed);
         self.draw_resolution_section(frame, standard, ResolutionSection::Standard);
         self.draw_resolution_section(frame, extension, ResolutionSection::Extension);
@@ -79,6 +90,33 @@ impl App {
     }
 
     fn draw_monitor_selector(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width < 90 {
+            let [selector_area, override_area] =
+                Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+                    .areas(area);
+            let label = self
+                .selected_monitor()
+                .map(|monitor| monitor.label())
+                .unwrap_or_else(|| "No monitors".to_string());
+            frame.render_widget(
+                Paragraph::new(format!(" Monitor: {label}  ↕"))
+                    .block(Block::default().borders(Borders::ALL))
+                    .style(focus_style(self.focus == FocusArea::Monitor)),
+                selector_area,
+            );
+            self.push_hitbox(selector_area, HitTarget::MonitorSelector, 0);
+            let override_label = self
+                .selected_override_status()
+                .map(|status| status.short_label())
+                .unwrap_or("not installed");
+            frame.render_widget(
+                Paragraph::new(format!(" EDID: {override_label}"))
+                    .block(Block::default().borders(Borders::ALL)),
+                override_area,
+            );
+            return;
+        }
+
         let [label_area, selector_area, mode_area, override_area] = Layout::horizontal([
             Constraint::Length(12),
             Constraint::Min(20),
@@ -181,9 +219,8 @@ impl App {
                     false,
                 );
                 let text = format!(
-                    "{} [{}] {}x{} @ {} Hz{}",
+                    "{} {}x{} @ {} Hz{}",
                     if selected { ">" } else { " " },
-                    if selected { "x" } else { " " },
                     timing.width,
                     timing.height,
                     timing.refresh_hz,
@@ -191,16 +228,6 @@ impl App {
                 );
                 frame.render_widget(Paragraph::new(text).style(row_style(selected)), row);
                 self.push_hitbox(row, HitTarget::EstablishedRow(index), 0);
-                self.push_hitbox(
-                    Rect {
-                        x: row.x + 2,
-                        y: row.y,
-                        width: 3,
-                        height: 1,
-                    },
-                    HitTarget::EstablishedCheckbox(index),
-                    0,
-                );
             }
         }
     }
@@ -211,8 +238,12 @@ impl App {
         area: Rect,
         section: ResolutionSection,
     ) {
-        let [list_area, buttons_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(area);
+        let show_buttons = area.height >= 8 && area.width >= 58;
+        let [list_area, buttons_area] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(if show_buttons { 3 } else { 0 }),
+        ])
+        .areas(area);
         let inner = inner_rect(list_area);
         self.sync_section_scroll(section, inner.height);
         let title = self.section_title(section, inner.height);
@@ -239,7 +270,9 @@ impl App {
             }
         }
 
-        self.draw_section_buttons(frame, buttons_area, section);
+        if show_buttons {
+            self.draw_section_buttons(frame, buttons_area, section);
+        }
     }
 
     fn draw_detailed_rows(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -610,87 +643,58 @@ impl App {
         area: Rect,
         section: ResolutionSection,
     ) {
-        let [
-            add,
-            edit,
-            delete,
-            delete_all,
-            reset,
-            copy,
-            up,
-            down,
-            _spacer,
-        ] = Layout::horizontal([
-            Constraint::Length(7),
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Length(13),
-            Constraint::Length(9),
-            Constraint::Length(8),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ])
-        .areas(area);
-        let buttons = [
-            (add, "Add", SectionAction::Add),
-            (edit, "Edit", SectionAction::Edit),
-            (delete, "Delete", SectionAction::Delete),
-            (delete_all, "Delete All", SectionAction::DeleteAll),
-            (reset, "Reset", SectionAction::Reset),
-            (copy, "Copy", SectionAction::Copy),
-            (up, "Up", SectionAction::MoveUp),
-            (down, "Down", SectionAction::MoveDown),
-        ];
-
-        for (rect, label, action) in buttons {
+        let buttons: Vec<(&str, SectionAction)> = match section {
+            ResolutionSection::Detailed => vec![
+                ("Add", SectionAction::Add),
+                ("Edit", SectionAction::Edit),
+                ("Delete", SectionAction::Delete),
+                ("Delete All", SectionAction::DeleteAll),
+                ("Reset", SectionAction::Reset),
+                ("Copy", SectionAction::Copy),
+                ("Up", SectionAction::MoveUp),
+                ("Down", SectionAction::MoveDown),
+            ],
+            ResolutionSection::Standard => vec![
+                ("Add", SectionAction::Add),
+                ("Edit", SectionAction::Edit),
+                ("Delete", SectionAction::Delete),
+                ("Delete All", SectionAction::DeleteAll),
+                ("Reset", SectionAction::Reset),
+            ],
+            ResolutionSection::Extension => vec![
+                ("Add", SectionAction::Add),
+                ("Edit", SectionAction::Edit),
+                ("Delete", SectionAction::Delete),
+                ("Delete All", SectionAction::DeleteAll),
+                ("Reset", SectionAction::Reset),
+                ("Copy", SectionAction::Copy),
+            ],
+        };
+        let constraints = vec![Constraint::Ratio(1, buttons.len() as u32); buttons.len()];
+        let rects = Layout::horizontal(constraints).split(area);
+        for (rect, (label, action)) in rects.iter().copied().zip(buttons) {
             self.draw_button(frame, rect, label);
             self.push_hitbox(rect, HitTarget::SectionButton(section, action), 0);
         }
     }
 
     fn draw_global_buttons(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let [
-            import,
-            export,
-            switch,
-            verify,
-            install,
-            uninstall,
-            spacer,
-            ok,
-            cancel,
-        ] = Layout::horizontal([
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(10),
-            Constraint::Length(11),
-            Constraint::Min(0),
-            Constraint::Length(6),
-            Constraint::Length(8),
-        ])
-        .areas(area);
-
-        let _ = spacer;
         let install_label = if self.selected_override_present() {
             "Update"
         } else {
             "Install"
         };
         let buttons = [
-            (import, "Import", GlobalAction::Import),
-            (export, "Export", GlobalAction::Export),
-            (switch, "Switch", GlobalAction::SwitchMode),
-            (verify, "Verify", GlobalAction::VerifyMode),
-            (install, install_label, GlobalAction::Install),
-            (uninstall, "Uninstall", GlobalAction::Uninstall),
-            (ok, "OK", GlobalAction::Ok),
-            (cancel, "Cancel", GlobalAction::Cancel),
+            ("Import", GlobalAction::Import),
+            ("Export", GlobalAction::Export),
+            ("Switch", GlobalAction::SwitchMode),
+            ("Verify", GlobalAction::VerifyMode),
+            (install_label, GlobalAction::Install),
+            ("Uninstall", GlobalAction::Uninstall),
         ];
-
-        for (rect, label, action) in buttons {
+        let constraints = vec![Constraint::Ratio(1, buttons.len() as u32); buttons.len()];
+        let rects = Layout::horizontal(constraints).split(area);
+        for (rect, (label, action)) in rects.iter().copied().zip(buttons) {
             self.draw_button(frame, rect, label);
             self.push_hitbox(rect, HitTarget::GlobalButton(action), 0);
         }
@@ -1087,13 +1091,18 @@ impl App {
         let text =
             std::iter::once("The following system changes will be made as root:".to_string())
                 .chain(std::iter::once(String::new()))
-                .chain(dialog.summary_lines.iter().map(|l| format!("  {l}")))
+                .chain(dialog.summary_lines.iter().map(|line| format!("  {line}")))
                 .chain(std::iter::once(String::new()))
                 .chain(std::iter::once(reboot_text.to_string()))
                 .collect::<Vec<_>>()
                 .join("\n");
 
-        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
+        frame.render_widget(
+            Paragraph::new(text)
+                .scroll((dialog.scroll.min(u16::MAX as usize) as u16, 0))
+                .wrap(Wrap { trim: false }),
+            body,
+        );
 
         let [apply_btn, cancel_btn, _spacer] = Layout::horizontal([
             Constraint::Length(12),
@@ -1172,13 +1181,17 @@ impl App {
             });
         }
         lines.push(String::new());
-        // Show output (truncated to fit)
-        for line in dialog.output.lines().take(8) {
+        for line in dialog.output.lines() {
             lines.push(line.to_string());
         }
         let text = lines.join("\n");
 
-        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
+        frame.render_widget(
+            Paragraph::new(text)
+                .scroll((dialog.scroll.min(u16::MAX as usize) as u16, 0))
+                .wrap(Wrap { trim: false }),
+            body,
+        );
 
         let [close_btn, _spacer] =
             Layout::horizontal([Constraint::Length(12), Constraint::Min(0)]).areas(actions);

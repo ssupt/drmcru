@@ -71,7 +71,6 @@ impl App {
                     if matches!(
                         target,
                         HitTarget::EstablishedRow(_)
-                            | HitTarget::EstablishedCheckbox(_)
                             | HitTarget::DetailedRow(_)
                             | HitTarget::StandardRow(_)
                             | HitTarget::ExtensionRow(_)
@@ -92,7 +91,7 @@ impl App {
                 self.focus = FocusArea::Monitor;
                 self.move_monitor(1);
             }
-            HitTarget::EstablishedRow(index) | HitTarget::EstablishedCheckbox(index) => {
+            HitTarget::EstablishedRow(index) => {
                 self.selected_established = Some(index);
                 self.focus = FocusArea::Established;
             }
@@ -203,14 +202,11 @@ impl App {
     fn activate_global_action(&mut self, action: GlobalAction) {
         match action {
             GlobalAction::Import => self.open_import_dialog(),
-            GlobalAction::Export | GlobalAction::Ok => self.export_selected_monitor(),
+            GlobalAction::Export => self.export_selected_monitor(),
             GlobalAction::SwitchMode => self.switch_selected_monitor_mode(),
             GlobalAction::VerifyMode => self.verify_selected_monitor_mode(),
             GlobalAction::Install => self.apply_selected_monitor(),
             GlobalAction::Uninstall => self.uninstall_selected_monitor(),
-            GlobalAction::Cancel => {
-                self.status = "Cancel requested. Press q or Esc to quit.".to_string();
-            }
         }
     }
 
@@ -437,13 +433,54 @@ impl App {
         match key.code {
             KeyCode::Enter => self.confirm_apply(),
             KeyCode::Esc => self.cancel_apply(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(dialog) = self.apply_confirm_dialog.as_mut() {
+                    dialog.scroll_by(1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(dialog) = self.apply_confirm_dialog.as_mut() {
+                    dialog.scroll_by(-1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(dialog) = self.apply_confirm_dialog.as_mut() {
+                    dialog.scroll_by(8);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(dialog) = self.apply_confirm_dialog.as_mut() {
+                    dialog.scroll_by(-8);
+                }
+            }
             _ => {}
         }
     }
 
     pub(super) fn handle_apply_result_key(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-            self.dismiss_apply_result();
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => self.dismiss_apply_result(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(dialog) = self.apply_result_dialog.as_mut() {
+                    dialog.scroll_by(1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(dialog) = self.apply_result_dialog.as_mut() {
+                    dialog.scroll_by(-1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(dialog) = self.apply_result_dialog.as_mut() {
+                    dialog.scroll_by(8);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(dialog) = self.apply_result_dialog.as_mut() {
+                    dialog.scroll_by(-8);
+                }
+            }
+            _ => {}
         }
     }
 

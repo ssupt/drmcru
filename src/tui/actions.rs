@@ -3,14 +3,16 @@ use super::state::{
     ExportConfirmDialog, ExportDialog, ImportDialog, StandardEditorMode, StandardResolutionEditor,
     SystemOperation,
 };
-use super::{App, ExtensionRow, FocusArea, ModeKey, ModeProvenance, PendingSystemAction};
+use super::{
+    App, ExtensionRow, FocusArea, ModeKey, ModeProvenance, PendingSystemAction, SystemExecution,
+};
 use crate::edid::DtdLocation;
 use crate::export::{custom_edid_file_name, export_patched_edid, export_workspace_edid};
 use crate::hyprland::{self, ModeRequest};
 use crate::hyprland_config::{self, MonitorRuleInspection};
 use crate::install::{self, InstallPlan, InstallPreview, UninstallPlan, UninstallPreview};
 use crate::models::{CtaVideoDescriptor, StandardTiming, StandardTimingAspect};
-use crate::validation::{internal_panel_scaling_warning, validate_timing};
+use crate::validation::{TimingWarningSeverity, internal_panel_scaling_warning, validate_timing};
 use crate::workspace::{EdidWorkspace, MoveDirection, format_location};
 use std::fs;
 use std::path::PathBuf;
@@ -35,9 +37,15 @@ impl App {
                 .get(index)
                 .map(|row| row.timing.clone())
                 .unwrap_or_else(|| self.draft_timing.clone()),
-            EditorMode::EditCta { extension_row, .. } => self
+            EditorMode::EditCta { location, .. } => self
                 .working_cta_dtd_slots()
-                .get(extension_row)
+                .into_iter()
+                .find(|row| {
+                    DtdLocation::Cta {
+                        extension_index: row.extension_index,
+                        slot: row.slot,
+                    } == location
+                })
                 .and_then(|row| row.timing.clone())
                 .unwrap_or_else(|| self.draft_timing.clone()),
         };
@@ -786,12 +794,7 @@ impl App {
                 if matches!(mode, EditorMode::Add) {
                     self.selected_detailed = self.working_dtds().len().checked_sub(1);
                 } else if matches!(mode, EditorMode::AddCta { .. }) {
-                    self.selected_extension = self.working_cta_dtd_slots().iter().position(|row| {
-                        DtdLocation::Cta {
-                            extension_index: row.extension_index,
-                            slot: row.slot,
-                        } == location
-                    });
+                    self.selected_extension = self.extension_row_index_for_location(location);
                 }
                 self.status = format!(
                     "Applied {} at {}. Export writes the workspace EDID.{}",
@@ -938,7 +941,13 @@ impl App {
 
         let result = match self.selected_workspace() {
             Some(workspace) if workspace.has_changes() => {
-                export_workspace_edid(monitor, workspace, &self.draft_timing, &output_dir)
+                let Some(mode) = self.workspace_target_mode() else {
+                    self.status =
+                        "Export needs at least one resolution to generate a Hyprland rule."
+                            .to_string();
+                    return;
+                };
+                export_workspace_edid(monitor, workspace, &mode, &output_dir)
             }
             _ => export_patched_edid(monitor, &self.draft_timing, &output_dir),
         };
@@ -977,9 +986,7 @@ impl App {
 
         if exporting_workspace {
             if let Some(workspace) = self.selected_workspace() {
-                for issue in workspace.validate() {
-                    issues.push(format!("Error: {}", issue.message));
-                }
+                issues.extend(self.workspace_validation_issues(workspace));
             }
         } else {
             let Some(edid) = monitor.edid.as_ref() else {
@@ -1015,57 +1022,102 @@ impl App {
             );
         }
 
-        issues.extend(
-            validate_timing(&self.draft_timing)
-                .into_iter()
-                .map(|warning| format!("Draft timing {}: {}", warning.label(), warning.message)),
-        );
-        if let Some(warning) = self.internal_panel_timing_warning() {
-            issues.push(format!("Panel warning: {}", warning.message));
-        }
+        if !exporting_workspace {
+            issues.extend(
+                validate_timing(&self.draft_timing)
+                    .into_iter()
+                    .map(|warning| {
+                        format!("Draft timing {}: {}", warning.label(), warning.message)
+                    }),
+            );
+            if let Some(warning) = self.internal_panel_timing_warning() {
+                issues.push(format!("Panel warning: {}", warning.message));
+            }
 
-        if let Some(key) = ModeKey::from_timing(&self.draft_timing) {
-            let provenance = self.mode_provenance(key);
-            if provenance.sources.len() > 1 {
-                issues.push(format!(
-                    "Draft timing duplicates an existing mode in {} source(s): {}.",
-                    provenance.sources.len(),
-                    provenance.sources.join(", ")
-                ));
+            if let Some(key) = ModeKey::from_timing(&self.draft_timing) {
+                let provenance = self.mode_provenance(key);
+                if provenance.sources.len() > 1 {
+                    issues.push(format!(
+                        "Draft timing duplicates an existing mode in {} source(s): {}.",
+                        provenance.sources.len(),
+                        provenance.sources.join(", ")
+                    ));
+                }
             }
         }
 
         issues
     }
 
-    fn install_timing_warning_lines(&self) -> Vec<String> {
-        let mut lines = validate_timing(&self.draft_timing)
+    fn workspace_validation_issues(&self, workspace: &EdidWorkspace) -> Vec<String> {
+        let mut issues = workspace
+            .validate()
             .into_iter()
-            .map(|warning| {
-                format!(
-                    "Warning:    Draft timing {}: {}",
-                    warning.label(),
-                    warning.message
-                )
-            })
+            .map(|issue| format!("Error: {}", issue.message))
             .collect::<Vec<_>>();
 
-        if let Some(warning) = self.internal_panel_timing_warning() {
-            lines.push(format!("Warning:    {}", warning.message));
-        }
-
-        if let Some(key) = ModeKey::from_timing(&self.draft_timing) {
-            let provenance = self.mode_provenance(key);
-            if provenance.sources.len() > 1 {
-                lines.push(format!(
-                    "Warning:    Draft mode already appears in {} source(s): {}",
-                    provenance.sources.len(),
-                    provenance.sources.join(", ")
-                ));
+        if let Ok(rows) = workspace.dtds() {
+            for row in rows {
+                for warning in validate_timing(&row.timing) {
+                    let prefix = match warning.severity {
+                        TimingWarningSeverity::Error => "Error",
+                        TimingWarningSeverity::Warning => "Warning",
+                    };
+                    issues.push(format!(
+                        "{prefix}: {}: {}",
+                        format_location(row.location),
+                        warning.message
+                    ));
+                }
             }
         }
 
-        lines
+        if let Some(warning) = self.internal_panel_timing_warning() {
+            issues.push(format!("Warning: {}", warning.message));
+        }
+
+        issues.sort();
+        issues.dedup();
+        issues
+    }
+
+    fn workspace_target_mode(&self) -> Option<String> {
+        self.selected_switch_mode()
+            .map(|candidate| candidate.request.label())
+            .or_else(|| {
+                self.working_dtds()
+                    .first()
+                    .map(|row| row.timing.hyprland_mode())
+            })
+            .or_else(|| {
+                self.working_standard_timings().first().map(|row| {
+                    format!(
+                        "{}x{}@{}",
+                        row.timing.width, row.timing.height, row.timing.refresh_hz
+                    )
+                })
+            })
+            .or_else(|| {
+                self.selected_edid()
+                    .and_then(|edid| edid.established_timings.first())
+                    .map(|timing| {
+                        format!("{}x{}@{}", timing.width, timing.height, timing.refresh_hz)
+                    })
+            })
+    }
+
+    fn extension_row_index_for_location(&self, location: DtdLocation) -> Option<usize> {
+        self.working_extension_rows()
+            .iter()
+            .position(|row| match row {
+                ExtensionRow::Dtd(row) => {
+                    DtdLocation::Cta {
+                        extension_index: row.extension_index,
+                        slot: row.slot,
+                    } == location
+                }
+                _ => false,
+            })
     }
 
     fn internal_panel_timing_warning(&self) -> Option<crate::validation::TimingWarning> {
@@ -1387,7 +1439,6 @@ impl App {
             self.status = "No monitor selected.".to_string();
             return;
         };
-        let connector = monitor.connector.clone();
         let monitor = monitor.clone();
         let override_status = self.selected_override_status().cloned();
         let operation = if override_status
@@ -1403,27 +1454,45 @@ impl App {
             self.status = "Could not determine current output directory.".to_string();
             return;
         };
-
-        let result = match self.selected_workspace() {
-            Some(workspace) if workspace.has_changes() => {
-                export_workspace_edid(&monitor, workspace, &self.draft_timing, &output_dir)
-            }
-            _ => export_patched_edid(&monitor, &self.draft_timing, &output_dir),
+        let Some(workspace) = self
+            .selected_workspace()
+            .filter(|workspace| workspace.has_changes())
+        else {
+            self.status =
+                "No workspace changes are pending. Add, edit, delete, or import a timing first."
+                    .to_string();
+            return;
         };
-
-        let export_result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                self.status = format!("Install failed during export: {error}");
-                return;
-            }
+        let workspace = workspace.clone();
+        let Some(hyprland_mode) = self.workspace_target_mode() else {
+            self.status = "Apply needs at least one resolution in the working EDID.".to_string();
+            return;
         };
+        let validation_issues = self.workspace_validation_issues(&workspace);
+        let validation_errors = validation_issues
+            .iter()
+            .filter(|issue| issue.starts_with("Error:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !validation_errors.is_empty() {
+            self.apply_result_dialog = Some(ApplyResultDialog {
+                operation,
+                success: false,
+                output: validation_errors.join("\n"),
+                scroll: 0,
+            });
+            self.status =
+                "Apply blocked because the working EDID has validation errors.".to_string();
+            return;
+        }
 
+        let connector = monitor.connector.clone();
+        let edid_file_name = custom_edid_file_name(&connector);
         let plan = InstallPlan {
             connector: connector.clone(),
-            edid_source: export_result.path.clone(),
-            edid_file_name: export_result.plan.edid_file_name.clone(),
-            kernel_parameter: export_result.plan.drm_kernel_parameter(),
+            edid_source: output_dir.join(&edid_file_name),
+            kernel_parameter: format!("drm.edid_firmware={connector}:edid/{edid_file_name}"),
+            edid_file_name,
         };
         let preview = InstallPreview::from_plan(&plan);
         let mut summary_lines = preview.summary_lines();
@@ -1433,7 +1502,12 @@ impl App {
                 summary_lines.push(format!("Warning:    {warning}"));
             }
         }
-        summary_lines.extend(self.install_timing_warning_lines());
+        summary_lines.push(format!("Hyprland:  {hyprland_mode}"));
+        summary_lines.extend(
+            validation_issues
+                .into_iter()
+                .map(|issue| format!("Validation: {issue}")),
+        );
         let support = install::inspect_system_support();
         if !support.is_supported() {
             self.detailed_editor = None;
@@ -1448,6 +1522,7 @@ impl App {
                 operation,
                 success: false,
                 output: support.report_text(),
+                scroll: 0,
             });
             self.status =
                 "Automatic Apply is unsupported on this system. Review the details.".to_string();
@@ -1463,7 +1538,13 @@ impl App {
         self.export_dialog = None;
         self.apply_result_dialog = None;
 
-        self.pending_system_action = Some(PendingSystemAction::Install { plan, operation });
+        self.pending_system_action = Some(PendingSystemAction::Install {
+            monitor: Box::new(monitor),
+            workspace: Box::new(workspace),
+            hyprland_mode,
+            output_dir,
+            operation,
+        });
         self.apply_confirm_dialog = Some(ApplyConfirmDialog::new(operation, summary_lines));
         self.status = match operation {
             SystemOperation::Install => {
@@ -1520,6 +1601,7 @@ impl App {
                 operation: SystemOperation::Uninstall,
                 success: false,
                 output: support.report_text(),
+                scroll: 0,
             });
             self.status = "Automatic uninstall is unsupported on this system. Review the details."
                 .to_string();
@@ -1553,6 +1635,37 @@ impl App {
             PendingSystemAction::Install { operation, .. } => *operation,
             PendingSystemAction::Uninstall(_) => SystemOperation::Uninstall,
         };
+
+        let execution = match action {
+            PendingSystemAction::Install {
+                monitor,
+                workspace,
+                hyprland_mode,
+                output_dir,
+                ..
+            } => {
+                let export_result = match export_workspace_edid(
+                    &monitor,
+                    &workspace,
+                    &hyprland_mode,
+                    &output_dir,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.apply_confirm_dialog = None;
+                        self.status = format!("Apply failed during export: {error}");
+                        return;
+                    }
+                };
+                SystemExecution::Install(InstallPlan {
+                    connector: monitor.connector,
+                    edid_source: export_result.path,
+                    edid_file_name: export_result.plan.edid_file_name.clone(),
+                    kernel_parameter: export_result.plan.drm_kernel_parameter(),
+                })
+            }
+            PendingSystemAction::Uninstall(plan) => SystemExecution::Uninstall(plan),
+        };
         self.apply_confirm_dialog = None;
         self.applying_in_progress = true;
         self.applying_operation = Some(operation);
@@ -1568,9 +1681,9 @@ impl App {
         self.install_receiver = Some(rx);
 
         std::thread::spawn(move || {
-            let result = match action {
-                PendingSystemAction::Install { plan, .. } => install::install(&plan),
-                PendingSystemAction::Uninstall(plan) => install::uninstall(&plan),
+            let result = match execution {
+                SystemExecution::Install(plan) => install::install(&plan),
+                SystemExecution::Uninstall(plan) => install::uninstall(&plan),
             };
             let _ = tx.send((operation, result));
         });
@@ -1591,6 +1704,7 @@ impl App {
                     operation,
                     success: report.success,
                     output: report.output,
+                    scroll: 0,
                 });
                 self.status = match operation {
                     SystemOperation::Install => {
@@ -1627,6 +1741,7 @@ impl App {
                     operation,
                     success: false,
                     output: error.to_string(),
+                    scroll: 0,
                 });
                 self.status = match operation {
                     SystemOperation::Install => format!("Install failed: {error}"),

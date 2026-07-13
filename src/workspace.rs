@@ -1,8 +1,9 @@
 use crate::edid::{
-    CtaDtdSlot, DtdLocation, EdidError, EdidSlotSummary, LocatedStandardTiming, cta_dtd_slots,
-    delete_detailed_timing, delete_standard_timing, detailed_timing_locations,
-    insert_cta_detailed_timing, insert_detailed_timing, insert_standard_timing, parse_edid,
-    patch_detailed_timing, patch_standard_timing, slot_summary, standard_timing_locations,
+    CtaDtdSlot, DtdLocation, EdidError, EdidSlotSummary, LocatedStandardTiming,
+    block_checksum_valid, cta_dtd_slots, delete_detailed_timing, delete_standard_timing,
+    detailed_timing_locations, insert_cta_detailed_timing, insert_detailed_timing,
+    insert_standard_timing, parse_edid, patch_detailed_timing, patch_standard_timing, slot_summary,
+    standard_timing_locations,
 };
 use crate::models::{EdidData, StandardTiming, TimingDescriptor};
 use std::path::Path;
@@ -268,19 +269,24 @@ impl EdidWorkspace {
 
     pub fn validate(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
-        if !self.working.checksum_valid {
+        let expected_len = (usize::from(self.working.extension_blocks) + 1) * 128;
+        if self.working.raw.len() != expected_len {
             issues.push(ValidationIssue {
-                message: "base EDID checksum is invalid".to_string(),
+                message: format!(
+                    "EDID length is {} bytes but its extension count requires {expected_len}",
+                    self.working.raw.len()
+                ),
             });
         }
 
-        for cta in &self.working.cta_blocks {
-            if !cta.checksum_valid {
+        for (index, block) in self.working.raw.chunks_exact(128).enumerate() {
+            if !block_checksum_valid(block) {
                 issues.push(ValidationIssue {
-                    message: format!(
-                        "CTA-861 extension {} checksum is invalid",
-                        cta.extension_index
-                    ),
+                    message: if index == 0 {
+                        "base EDID checksum is invalid".to_string()
+                    } else {
+                        format!("EDID extension {index} checksum is invalid")
+                    },
                 });
             }
         }
@@ -484,6 +490,35 @@ mod tests {
         let workspace = EdidWorkspace::new(minimal_base_edid(0)).expect("workspace");
 
         assert!(workspace.validate().is_empty());
+    }
+
+    #[test]
+    fn validation_checks_extension_count_and_every_block_checksum() {
+        let mut truncated = minimal_base_edid(1);
+        let workspace = EdidWorkspace::new(truncated.clone()).expect("workspace");
+        assert!(
+            workspace
+                .validate()
+                .iter()
+                .any(|issue| issue.message.contains("length"))
+        );
+
+        truncated[126] = 0;
+        repair_checksum(&mut truncated);
+        let mut raw = truncated;
+        let mut unknown = vec![0u8; 128];
+        unknown[0] = 0x70;
+        unknown[10] = 1;
+        raw[126] = 1;
+        repair_checksum(&mut raw[..128]);
+        raw.extend(unknown);
+        let workspace = EdidWorkspace::new(raw).expect("workspace");
+        assert!(
+            workspace
+                .validate()
+                .iter()
+                .any(|issue| issue.message.contains("extension 1 checksum"))
+        );
     }
 
     #[test]

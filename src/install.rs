@@ -490,13 +490,13 @@ fn inspect_override_with_paths(
         "bootloader config",
         &mut read_warnings,
     );
-    let limine_entry_tool_references_kernel_parameter = file_contains(
+    let limine_entry_tool_references_kernel_parameter = file_contains_kernel_mapping(
         paths.limine_entry_tool_dropin,
         kernel_parameter,
         "Limine entry-tool drop-in",
         &mut read_warnings,
     );
-    let active_kernel_references_kernel_parameter = file_contains(
+    let active_kernel_references_kernel_parameter = file_contains_kernel_mapping(
         paths.active_cmdline,
         kernel_parameter,
         "active kernel command line",
@@ -547,6 +547,37 @@ fn file_contains(path: &Path, needle: &str, label: &str, warnings: &mut Vec<Stri
     }
 }
 
+fn file_contains_kernel_mapping(
+    path: &Path,
+    kernel_parameter: &str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    match fs::read_to_string(path) {
+        Ok(contents) => text_contains_kernel_mapping(&contents, kernel_parameter),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            warnings.push(format!(
+                "Could not read {label} {}: {error}",
+                path.display()
+            ));
+            false
+        }
+    }
+}
+
+fn text_contains_kernel_mapping(contents: &str, kernel_parameter: &str) -> bool {
+    let Some(expected) = kernel_parameter.strip_prefix("drm.edid_firmware=") else {
+        return false;
+    };
+
+    contents
+        .split(|character: char| character.is_whitespace() || matches!(character, '"' | '\'' | ';'))
+        .filter_map(|token| token.strip_prefix("drm.edid_firmware="))
+        .flat_map(|value| value.split(','))
+        .any(|mapping| mapping == expected)
+}
+
 fn limine_cmdline_reference_stats(
     path: &Path,
     needle: &str,
@@ -560,7 +591,7 @@ fn limine_cmdline_reference_stats(
             for line in contents.lines() {
                 if line.trim_start().starts_with("cmdline:") {
                     cmdlines += 1;
-                    if line.contains(needle) {
+                    if text_contains_kernel_mapping(line, needle) {
                         matching += 1;
                     }
                 }
@@ -645,13 +676,32 @@ MKINIT="/etc/mkinitcpio.conf"
 LIMINE="/boot/limine.conf"
 LIMINE_DROPIN_DIR="/etc/limine-entry-tool.d"
 LIMINE_DROPIN="$LIMINE_DROPIN_DIR/drmcru-edid.conf"
-BACKUP_SUFFIX=".drmcru.$(date +%Y%m%d-%H%M%S).bak"
+BACKUP_SUFFIX=".drmcru.$(date +%Y%m%d-%H%M%S-%N)-$$.bak"
+declare -a BACKUP_ORIGINALS=()
+declare -a BACKUP_PATHS=()
+FIRMWARE_WAS_PRESENT=0
 
 backup_file() {{
     local file="$1"
     local backup="${{file}}${{BACKUP_SUFFIX}}"
     cp -a -- "$file" "$backup"
+    BACKUP_ORIGINALS+=("$file")
+    BACKUP_PATHS+=("$backup")
     echo "[OK] Backup: $backup"
+}}
+
+rollback() {{
+    local status="$?"
+    trap - ERR
+    echo "[ERR] Apply failed; restoring files changed by this run." >&2
+    local i
+    for ((i=${{#BACKUP_ORIGINALS[@]}} - 1; i >= 0; i--)); do
+        cp -a -- "${{BACKUP_PATHS[$i]}}" "${{BACKUP_ORIGINALS[$i]}}" || true
+    done
+    if [ "$FIRMWARE_WAS_PRESENT" -eq 0 ]; then
+        rm -f -- "$FIRMWARE_TARGET" || true
+    fi
+    exit "$status"
 }}
 
 if [ ! -f "$EDID_SOURCE" ]; then
@@ -683,6 +733,12 @@ if ! command -v limine-mkinitcpio >/dev/null 2>&1 && ! compgen -G "/etc/mkinitcp
     echo "[ERR] No initramfs rebuild backend found (expected limine-mkinitcpio or mkinitcpio presets)" >&2
     exit 1
 fi
+
+if [ -e "$FIRMWARE_TARGET" ]; then
+    FIRMWARE_WAS_PRESENT=1
+    backup_file "$FIRMWARE_TARGET"
+fi
+trap rollback ERR
 
 # 1. Copy EDID to firmware directory
 install -D -m 0644 -- "$EDID_SOURCE" "$FIRMWARE_TARGET"
@@ -722,71 +778,90 @@ fi
 #    to embed the same kernel parameter into regenerated Limine entries/UKIs.
 if command -v limine-mkinitcpio >/dev/null 2>&1; then
     mkdir -p "$LIMINE_DROPIN_DIR"
-    if [ -f "$LIMINE_DROPIN" ] && grep -qF -- "$KERNEL_PARAM" "$LIMINE_DROPIN" 2>/dev/null; then
-        echo "[OK] Limine entry-tool drop-in already has kernel parameter (skipped)"
+    if [ -f "$LIMINE_DROPIN" ]; then
+        backup_file "$LIMINE_DROPIN"
+        TMP="$(mktemp /tmp/drmcru-limine-entry.XXXXXX)"
+        awk -v connector="$CONNECTOR" -v param="$KERNEL_PARAM" '
+            function add_mapping(mapping) {{
+                if (mapping == "" || index(mapping, connector ":") == 1)
+                    return
+                if (!seen[mapping]++)
+                    mappings[++mapping_count] = mapping
+            }}
+            /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=/ && index($0, "drm.edid_firmware=") > 0 {{
+                value = substr($0, index($0, "drm.edid_firmware=") + length("drm.edid_firmware="))
+                sub(/[\"[:space:]].*$/, "", value)
+                count = split(value, values, ",")
+                for (i = 1; i <= count; i++)
+                    add_mapping(values[i])
+                next
+            }}
+            {{ print }}
+            END {{
+                desired = substr(param, length("drm.edid_firmware=") + 1)
+                add_mapping(desired)
+                combined = ""
+                for (i = 1; i <= mapping_count; i++)
+                    combined = combined (combined == "" ? "" : ",") mappings[i]
+                print "KERNEL_CMDLINE[default]+=\" drm.edid_firmware=" combined "\""
+            }}
+        ' "$LIMINE_DROPIN" > "$TMP"
+        cat "$TMP" > "$LIMINE_DROPIN"
+        rm -f "$TMP"
     else
-        if [ -f "$LIMINE_DROPIN" ]; then
-            backup_file "$LIMINE_DROPIN"
-            TMP="$(mktemp /tmp/drmcru-limine-entry.XXXXXX)"
-            awk -v connector="$CONNECTOR" -v param="$KERNEL_PARAM" '
-                BEGIN {{
-                    replacement = "KERNEL_CMDLINE[default]+=\" " param "\""
-                    replaced = 0
-                }}
-                /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=/ && index($0, "drm.edid_firmware=" connector ":") > 0 {{
-                    if (!replaced) {{
-                        print replacement
-                        replaced = 1
-                    }}
-                    next
-                }}
-                {{ print }}
-                END {{
-                    if (!replaced) {{
-                        print replacement
-                    }}
-                }}
-            ' "$LIMINE_DROPIN" > "$TMP"
-            cat "$TMP" > "$LIMINE_DROPIN"
-            rm -f "$TMP"
-        else
-            {{
-                echo "# Managed by drmcru. Edit through drmcru when possible."
-                printf 'KERNEL_CMDLINE[default]+=" %s"\n' "$KERNEL_PARAM"
-            }} > "$LIMINE_DROPIN"
-        fi
-        echo "[OK] Added persistent Limine entry-tool kernel parameter"
+        {{
+            echo "# Managed by drmcru. Edit through drmcru when possible."
+            printf 'KERNEL_CMDLINE[default]+=" %s"\n' "$KERNEL_PARAM"
+        }} > "$LIMINE_DROPIN"
     fi
+    echo "[OK] Consolidated persistent Limine entry-tool EDID mappings"
 else
     echo "[OK] limine-mkinitcpio not present; Limine entry-tool drop-in skipped"
 fi
 
-# 4. Patch /boot/limine.conf — add kernel parameter to Limine cmdline entries if not present
+# 4. Patch /boot/limine.conf. The kernel accepts one drm.edid_firmware value;
+#    connector mappings inside that value are comma-separated. Consolidate any
+#    older repeated parameters while replacing this connector's mapping.
 if [ -f "$LIMINE" ]; then
     if grep -qE '^[[:space:]]*cmdline:' "$LIMINE"; then
-        if awk -v param="$KERNEL_PARAM" '
-            /^[[:space:]]*cmdline:/ && index($0, param) == 0 {{ missing = 1 }}
-            END {{ exit missing ? 0 : 1 }}
-        ' "$LIMINE"; then
-            backup_file "$LIMINE"
-            TMP="$(mktemp /tmp/drmcru-limine.XXXXXX)"
-            awk -v param="$KERNEL_PARAM" '
-                /^[[:space:]]*cmdline:/ {{
-                    if (index($0, param) == 0) {{
-                        print $0 " " param
+        backup_file "$LIMINE"
+        TMP="$(mktemp /tmp/drmcru-limine.XXXXXX)"
+        awk -v connector="$CONNECTOR" -v param="$KERNEL_PARAM" '
+            function add_mapping(mapping) {{
+                if (mapping == "" || index(mapping, connector ":") == 1)
+                    return
+                if (!seen[mapping]++)
+                    mappings[++mapping_count] = mapping
+            }}
+            /^[[:space:]]*cmdline:/ {{
+                delete seen
+                delete mappings
+                mapping_count = 0
+                prefix = substr($0, 1, index($0, ":"))
+                other = ""
+                for (i = 2; i <= NF; i++) {{
+                    if (index($i, "drm.edid_firmware=") == 1) {{
+                        value = substr($i, length("drm.edid_firmware=") + 1)
+                        count = split(value, values, ",")
+                        for (j = 1; j <= count; j++)
+                            add_mapping(values[j])
                     }} else {{
-                        print
+                        other = other (other == "" ? "" : " ") $i
                     }}
-                    next
                 }}
-                {{ print }}
-            ' "$LIMINE" > "$TMP"
-            cat "$TMP" > "$LIMINE"
-            rm -f "$TMP"
-            echo "[OK] Added kernel parameter to missing Limine cmdline entries"
-        else
-            echo "[OK] Kernel parameter already in all Limine cmdline entries (skipped)"
-        fi
+                desired = substr(param, length("drm.edid_firmware=") + 1)
+                add_mapping(desired)
+                combined = ""
+                for (i = 1; i <= mapping_count; i++)
+                    combined = combined (combined == "" ? "" : ",") mappings[i]
+                print prefix (other == "" ? "" : " " other) " drm.edid_firmware=" combined
+                next
+            }}
+            {{ print }}
+        ' "$LIMINE" > "$TMP"
+        cat "$TMP" > "$LIMINE"
+        rm -f "$TMP"
+        echo "[OK] Consolidated EDID mappings in all Limine cmdline entries"
     else
         echo "[ERR] /boot/limine.conf has no cmdline entries" >&2
         exit 1
@@ -809,6 +884,8 @@ else
     echo "[ERR] No initramfs rebuild backend found" >&2
     exit 1
 fi
+
+trap - ERR
 
 echo ""
 echo "=== Done! Reboot to activate the custom resolution. ==="
@@ -844,13 +921,29 @@ MKINIT="/etc/mkinitcpio.conf"
 LIMINE="/boot/limine.conf"
 LIMINE_DROPIN_DIR="/etc/limine-entry-tool.d"
 LIMINE_DROPIN="$LIMINE_DROPIN_DIR/drmcru-edid.conf"
-BACKUP_SUFFIX=".drmcru.$(date +%Y%m%d-%H%M%S).bak"
+BACKUP_SUFFIX=".drmcru.$(date +%Y%m%d-%H%M%S-%N)-$$.bak"
+declare -a BACKUP_ORIGINALS=()
+declare -a BACKUP_PATHS=()
+FIRMWARE_WAS_PRESENT=0
 
 backup_file() {{
     local file="$1"
     local backup="${{file}}${{BACKUP_SUFFIX}}"
     cp -a -- "$file" "$backup"
+    BACKUP_ORIGINALS+=("$file")
+    BACKUP_PATHS+=("$backup")
     echo "[OK] Backup: $backup"
+}}
+
+rollback() {{
+    local status="$?"
+    trap - ERR
+    echo "[ERR] Uninstall failed; restoring files changed by this run." >&2
+    local i
+    for ((i=${{#BACKUP_ORIGINALS[@]}} - 1; i >= 0; i--)); do
+        cp -a -- "${{BACKUP_PATHS[$i]}}" "${{BACKUP_ORIGINALS[$i]}}" || true
+    done
+    exit "$status"
 }}
 
 if [ ! -f "$MKINIT" ]; then
@@ -877,6 +970,12 @@ if ! command -v limine-mkinitcpio >/dev/null 2>&1 && ! compgen -G "/etc/mkinitcp
     echo "[ERR] No initramfs rebuild backend found (expected limine-mkinitcpio or mkinitcpio presets)" >&2
     exit 1
 fi
+
+if [ -e "$FIRMWARE_TARGET" ]; then
+    FIRMWARE_WAS_PRESENT=1
+    backup_file "$FIRMWARE_TARGET"
+fi
+trap rollback ERR
 
 # 1. Remove EDID from firmware directory
 if [ -e "$FIRMWARE_TARGET" ]; then
@@ -915,14 +1014,33 @@ fi
 
 # 3. Patch Limine entry-tool drop-in when present
 if [ -f "$LIMINE_DROPIN" ]; then
-    if grep -qF -- "$KERNEL_PARAM" "$LIMINE_DROPIN" 2>/dev/null || grep -qF -- "drm.edid_firmware=$CONNECTOR:" "$LIMINE_DROPIN" 2>/dev/null; then
+    if grep -qF -- "drm.edid_firmware=" "$LIMINE_DROPIN" 2>/dev/null; then
         backup_file "$LIMINE_DROPIN"
         TMP="$(mktemp /tmp/drmcru-limine-entry.XXXXXX)"
-        awk -v connector="$CONNECTOR" -v param="$KERNEL_PARAM" '
-            /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=/ && (index($0, param) > 0 || index($0, "drm.edid_firmware=" connector ":") > 0) {{
+        awk -v connector="$CONNECTOR" '
+            function add_mapping(mapping) {{
+                if (mapping == "" || index(mapping, connector ":") == 1)
+                    return
+                if (!seen[mapping]++)
+                    mappings[++mapping_count] = mapping
+            }}
+            /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=/ && index($0, "drm.edid_firmware=") > 0 {{
+                value = substr($0, index($0, "drm.edid_firmware=") + length("drm.edid_firmware="))
+                sub(/[\"[:space:]].*$/, "", value)
+                count = split(value, values, ",")
+                for (i = 1; i <= count; i++)
+                    add_mapping(values[i])
                 next
             }}
             {{ print }}
+            END {{
+                if (mapping_count > 0) {{
+                    combined = ""
+                    for (i = 1; i <= mapping_count; i++)
+                        combined = combined (combined == "" ? "" : ",") mappings[i]
+                    print "KERNEL_CMDLINE[default]+=\" drm.edid_firmware=" combined "\""
+                }}
+            }}
         ' "$LIMINE_DROPIN" > "$TMP"
         cat "$TMP" > "$LIMINE_DROPIN"
         rm -f "$TMP"
@@ -939,25 +1057,47 @@ else
     echo "[OK] Limine entry-tool drop-in not present (skipped)"
 fi
 
-# 4. Patch /boot/limine.conf — remove kernel parameter if present
+# 4. Patch /boot/limine.conf — remove this connector mapping and consolidate
+#    any remaining mappings into a single drm.edid_firmware parameter.
 if [ -f "$LIMINE" ]; then
-    if grep -qF -- "$KERNEL_PARAM" "$LIMINE" 2>/dev/null; then
+    if grep -qF -- "drm.edid_firmware=" "$LIMINE" 2>/dev/null; then
         backup_file "$LIMINE"
         TMP="$(mktemp /tmp/drmcru-limine.XXXXXX)"
-        awk -v param="$KERNEL_PARAM" '
+        awk -v connector="$CONNECTOR" '
+            function add_mapping(mapping) {{
+                if (mapping == "" || index(mapping, connector ":") == 1)
+                    return
+                if (!seen[mapping]++)
+                    mappings[++mapping_count] = mapping
+            }}
             /^[[:space:]]*cmdline:/ {{
-                while ((pos = index($0, param)) > 0) {{
-                    before = substr($0, 1, pos - 1)
-                    after = substr($0, pos + length(param))
-                    sub(/^[[:space:]]+/, "", after)
-                    $0 = before after
+                delete seen
+                delete mappings
+                mapping_count = 0
+                prefix = substr($0, 1, index($0, ":"))
+                other = ""
+                for (i = 2; i <= NF; i++) {{
+                    if (index($i, "drm.edid_firmware=") == 1) {{
+                        value = substr($i, length("drm.edid_firmware=") + 1)
+                        count = split(value, values, ",")
+                        for (j = 1; j <= count; j++)
+                            add_mapping(values[j])
+                    }} else {{
+                        other = other (other == "" ? "" : " ") $i
+                    }}
                 }}
+                combined = ""
+                for (i = 1; i <= mapping_count; i++)
+                    combined = combined (combined == "" ? "" : ",") mappings[i]
+                print prefix (other == "" ? "" : " " other) \
+                    (combined == "" ? "" : " drm.edid_firmware=" combined)
+                next
             }}
             {{ print }}
         ' "$LIMINE" > "$TMP"
         cat "$TMP" > "$LIMINE"
         rm -f "$TMP"
-        echo "[OK] Removed kernel parameter from Limine cmdline entries"
+        echo "[OK] Removed connector mapping from Limine cmdline entries"
     else
         echo "[OK] Kernel parameter not present in Limine config (skipped)"
     fi
@@ -979,6 +1119,8 @@ else
     echo "[ERR] No initramfs rebuild backend found" >&2
     exit 1
 fi
+
+trap - ERR
 
 echo ""
 echo "=== Done! Reboot to return to the monitor's normal EDID. ==="
@@ -1029,11 +1171,11 @@ fn run_privileged_script(script: &str) -> Result<InstallReport, InstallError> {
     let result = Command::new("pkexec")
         .arg("bash")
         .arg(&script_path)
-        .output()
-        .map_err(InstallError::Launch)?;
+        .output();
 
-    // Clean up script
+    // Clean up even when pkexec cannot be launched.
     let _ = std::fs::remove_file(&script_path);
+    let result = result.map_err(InstallError::Launch)?;
 
     let stdout = String::from_utf8_lossy(&result.stdout).to_string();
     let stderr = String::from_utf8_lossy(&result.stderr).to_string();
@@ -1214,9 +1356,10 @@ mod tests {
     #[test]
     fn script_is_idempotent() {
         let script = build_install_script(&sample_plan());
-        // The script checks before modifying mkinitcpio FILES and per-cmdline Limine entries.
+        // The script checks mkinitcpio and de-duplicates connector mappings.
         assert!(script.contains("grep -qF"));
-        assert!(script.contains("index($0, param) == 0"));
+        assert!(script.contains("if (!seen[mapping]++)"));
+        assert!(script.contains("index(mapping, connector \":\") == 1"));
     }
 
     #[test]
@@ -1257,7 +1400,7 @@ mod tests {
         assert!(script.contains("rm -f -- \"$FIRMWARE_TARGET\""));
         assert!(script.contains("Removed EDID from mkinitcpio FILES"));
         assert!(script.contains("Removed persistent Limine entry-tool kernel parameter"));
-        assert!(script.contains("Removed kernel parameter from Limine cmdline entries"));
+        assert!(script.contains("Removed connector mapping from Limine cmdline entries"));
         assert!(script.contains("limine-mkinitcpio"));
         assert!(script.contains("mkinitcpio -P"));
     }
@@ -1295,9 +1438,25 @@ mod tests {
     fn install_script_updates_missing_limine_cmdlines_instead_of_global_skip() {
         let script = build_install_script(&sample_plan());
 
-        assert!(script.contains("Added kernel parameter to missing Limine cmdline entries"));
-        assert!(script.contains("Kernel parameter already in all Limine cmdline entries"));
+        assert!(script.contains("Consolidated EDID mappings in all Limine cmdline entries"));
+        assert!(script.contains("combined == \"\" ? \"\" : \",\""));
         assert!(!script.contains("Kernel parameter already in Limine config (skipped)"));
+    }
+
+    #[test]
+    fn mapping_detection_handles_consolidated_kernel_parameter() {
+        let dp1 = "drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin";
+        let cmdline = "quiet drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin,eDP-1:edid/drmcru_custom_eDP-1.bin splash";
+
+        assert!(text_contains_kernel_mapping(cmdline, dp1));
+        assert!(text_contains_kernel_mapping(
+            cmdline,
+            "drm.edid_firmware=eDP-1:edid/drmcru_custom_eDP-1.bin"
+        ));
+        assert!(!text_contains_kernel_mapping(
+            cmdline,
+            "drm.edid_firmware=DP-2:edid/drmcru_custom_DP-2.bin"
+        ));
     }
 
     #[test]

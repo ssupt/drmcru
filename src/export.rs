@@ -1,4 +1,5 @@
 use crate::edid::{DtdLocation, EdidError, insert_detailed_timing};
+use crate::hyprland_config;
 use crate::models::{ExportPlan, Monitor, TimingDescriptor};
 use crate::workspace::EdidWorkspace;
 use std::fs;
@@ -11,10 +12,13 @@ pub fn build_export_plan_with_file(
     edid_file_name: impl Into<String>,
     timing: TimingDescriptor,
 ) -> ExportPlan {
+    let connector = connector.into();
+    let hyprland_mode = timing.hyprland_mode();
     ExportPlan {
-        connector: connector.into(),
+        hyprland_rule: format!("monitor={connector},{hyprland_mode},auto,1"),
+        connector,
         edid_file_name: edid_file_name.into(),
-        timing,
+        hyprland_mode,
         position: "auto".to_string(),
         scale: "1".to_string(),
     }
@@ -67,14 +71,14 @@ pub fn export_patched_edid(
 pub fn export_workspace_edid(
     monitor: &Monitor,
     workspace: &EdidWorkspace,
-    timing: &TimingDescriptor,
+    hyprland_mode: &str,
     output_dir: &Path,
 ) -> Result<ExportResult, ExportError> {
     let connector = &monitor.connector;
     let file_name = custom_edid_file_name(connector);
     let path = output_dir.join(&file_name);
     let instructions_path = output_dir.join(instructions_file_name(connector));
-    let plan = build_export_plan_for_monitor(monitor, file_name, timing.clone());
+    let plan = build_export_plan_for_monitor_mode(monitor, file_name, hyprland_mode);
 
     fs::write(&path, workspace.export_bytes()).map_err(|source| ExportError::Write {
         path: path.clone(),
@@ -101,7 +105,7 @@ pub fn export_instructions(edid_path: &Path, plan: &ExportPlan) -> String {
         "1. Install the EDID override file:".to_string(),
         format!(
             "   sudo install -D -m 0644 {} {firmware_target}",
-            edid_path.display()
+            shell_quote(&edid_path.to_string_lossy())
         ),
         String::new(),
         "2. Add this kernel parameter to your bootloader:".to_string(),
@@ -116,6 +120,10 @@ pub fn export_instructions(edid_path: &Path, plan: &ExportPlan) -> String {
     .join("\n")
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 pub fn custom_edid_file_name(connector: &str) -> String {
     format!("drmcru_custom_{}.bin", file_safe_connector(connector))
 }
@@ -128,6 +136,36 @@ fn build_export_plan_for_monitor(
     let mut plan = build_export_plan_with_file(&monitor.connector, edid_file_name, timing);
     plan.position = monitor_position(monitor);
     plan.scale = monitor_scale(monitor);
+    plan.hyprland_rule = hyprland_config::format_monitor_rule(
+        &plan.connector,
+        &plan.hyprland_mode,
+        &plan.position,
+        &plan.scale,
+    );
+    plan
+}
+
+fn build_export_plan_for_monitor_mode(
+    monitor: &Monitor,
+    edid_file_name: impl Into<String>,
+    hyprland_mode: &str,
+) -> ExportPlan {
+    let mut plan = ExportPlan {
+        connector: monitor.connector.clone(),
+        edid_file_name: edid_file_name.into(),
+        hyprland_mode: hyprland_mode.to_string(),
+        hyprland_rule: String::new(),
+        position: "auto".to_string(),
+        scale: "1".to_string(),
+    };
+    plan.position = monitor_position(monitor);
+    plan.scale = monitor_scale(monitor);
+    plan.hyprland_rule = hyprland_config::format_monitor_rule(
+        &plan.connector,
+        &plan.hyprland_mode,
+        &plan.position,
+        &plan.scale,
+    );
     plan
 }
 
@@ -225,6 +263,14 @@ mod tests {
         assert!(instructions.contains("drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin"));
         assert!(instructions.contains("monitor=DP-1,1920x1080@"));
         assert!(instructions.contains(",auto,1"));
+    }
+
+    #[test]
+    fn instructions_shell_quote_generated_path() {
+        let plan = build_export_plan_with_file("DP-1", "custom.bin", sample_timing());
+        let instructions = export_instructions(Path::new("/tmp/user's exports/custom.bin"), &plan);
+
+        assert!(instructions.contains("'/tmp/user'\\''s exports/custom.bin'"));
     }
 
     #[test]

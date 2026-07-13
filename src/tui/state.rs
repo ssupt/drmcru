@@ -72,6 +72,7 @@ impl ExportConfirmDialog {
 pub(super) struct ApplyConfirmDialog {
     pub(super) operation: SystemOperation,
     pub(super) summary_lines: Vec<String>,
+    pub(super) scroll: usize,
 }
 
 impl ApplyConfirmDialog {
@@ -79,6 +80,18 @@ impl ApplyConfirmDialog {
         Self {
             operation,
             summary_lines,
+            scroll: 0,
+        }
+    }
+
+    pub(super) fn scroll_by(&mut self, delta: isize) {
+        if delta < 0 {
+            self.scroll = self.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.scroll = self
+                .scroll
+                .saturating_add(delta as usize)
+                .min(self.summary_lines.len().saturating_sub(1));
         }
     }
 }
@@ -88,6 +101,17 @@ pub(super) struct ApplyResultDialog {
     pub(super) operation: SystemOperation,
     pub(super) success: bool,
     pub(super) output: String,
+    pub(super) scroll: usize,
+}
+
+impl ApplyResultDialog {
+    pub(super) fn scroll_by(&mut self, delta: isize) {
+        if delta < 0 {
+            self.scroll = self.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.scroll = self.scroll.saturating_add(delta as usize);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

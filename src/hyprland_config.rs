@@ -65,6 +65,23 @@ pub fn inspect_connector_rules(connector: &str) -> MonitorRuleInspection {
     )
 }
 
+pub fn format_monitor_rule(connector: &str, mode: &str, position: &str, scale: &str) -> String {
+    if default_hyprland_config_path()
+        .extension()
+        .is_some_and(|extension| extension == "lua")
+    {
+        format!(
+            "hl.monitor({{ output = {}, mode = {}, position = {}, scale = {} }})",
+            lua_string(connector),
+            lua_string(mode),
+            lua_string(position),
+            scale
+        )
+    } else {
+        format!("monitor={connector},{mode},{position},{scale}")
+    }
+}
+
 fn inspect_monitor_rule_from(
     root_path: PathBuf,
     connector: &str,
@@ -96,14 +113,31 @@ fn inspect_monitor_rule_from(
 }
 
 fn default_hyprland_config_path() -> PathBuf {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home).join("hypr/hyprland.conf");
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    let hypr = config_home.join("hypr");
+    let lua = hypr.join("hyprland.lua");
+    if lua.exists() {
+        return lua;
     }
 
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/hypr/hyprland.conf")
+    hypr.join("hyprland.conf")
+}
+
+fn lua_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    )
 }
 
 #[derive(Default)]
@@ -131,6 +165,16 @@ impl ConfigParser {
             }
         };
         self.files_read += 1;
+
+        if path.extension().is_some_and(|extension| extension == "lua") {
+            self.monitor_rules
+                .extend(parse_lua_monitor_rules(&display_path, &contents));
+            for source in parse_lua_dofile_paths(&contents, &display_path, &mut self.read_warnings)
+            {
+                self.read_file(&source);
+            }
+            return;
+        }
 
         for (index, raw_line) in contents.lines().enumerate() {
             let line_number = index + 1;
@@ -162,6 +206,120 @@ impl ConfigParser {
             }
         }
     }
+}
+
+fn parse_lua_monitor_rules(path: &Path, contents: &str) -> Vec<MonitorRule> {
+    let mut rules = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative_start) = contents[search_from..].find("hl.monitor") {
+        let start = search_from + relative_start;
+        let Some(open_relative) = contents[start..].find('(') else {
+            break;
+        };
+        let open = start + open_relative;
+        let Some(end) = find_balanced_lua_call(contents, open) else {
+            break;
+        };
+        let raw = &contents[start..=end];
+        let fields = parse_lua_table_fields(raw);
+        let connector = fields.iter().find(|(key, _)| key == "output");
+        let mode = fields.iter().find(|(key, _)| key == "mode");
+        if let (Some((_, connector)), Some((_, mode))) = (connector, mode) {
+            rules.push(MonitorRule {
+                path: path.to_path_buf(),
+                line_number: contents[..start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1,
+                raw: raw.to_string(),
+                connector: connector.clone(),
+                mode: mode.clone(),
+                position: fields
+                    .iter()
+                    .find(|(key, _)| key == "position")
+                    .map(|(_, value)| value.clone()),
+                scale: fields
+                    .iter()
+                    .find(|(key, _)| key == "scale")
+                    .map(|(_, value)| value.clone()),
+            });
+        }
+        search_from = end + 1;
+    }
+    rules
+}
+
+fn find_balanced_lua_call(contents: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, character) in contents[open..].char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '(' {
+            depth += 1;
+        } else if character == ')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(open + relative);
+            }
+        }
+    }
+    None
+}
+
+fn parse_lua_table_fields(raw: &str) -> Vec<(String, String)> {
+    raw.split([',', '\n'])
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            let key = key
+                .trim()
+                .trim_start_matches("hl.monitor({")
+                .trim()
+                .to_string();
+            let value = value
+                .trim()
+                .trim_matches(|character| matches!(character, '"' | '\'' | '}' | ')'))
+                .trim()
+                .to_string();
+            matches!(key.as_str(), "output" | "mode" | "position" | "scale").then_some((key, value))
+        })
+        .collect()
+}
+
+fn parse_lua_dofile_paths(
+    contents: &str,
+    including_file: &Path,
+    warnings: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = strip_lua_comment(line).trim();
+            let value = line.strip_prefix("dofile(")?.strip_suffix(')')?;
+            let value = value.trim().trim_matches(['"', '\'']);
+            resolve_source_paths(value, including_file, warnings)
+                .into_iter()
+                .next()
+        })
+        .collect()
+}
+
+fn strip_lua_comment(line: &str) -> &str {
+    line.split_once("--")
+        .map(|(before, _)| before)
+        .unwrap_or(line)
 }
 
 fn parse_assignment(line: &str) -> Option<(&str, &str)> {
@@ -403,6 +561,35 @@ mod tests {
             rule.normalized_rule(),
             "monitor=DP-1,1920x1080@239.76,auto,1"
         );
+    }
+
+    #[test]
+    fn parses_lua_monitor_rules_and_literal_dofile() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("hyprland.lua");
+        let sourced = dir.join("monitors.lua");
+        fs::write(
+            &root,
+            "dofile('monitors.lua') -- literal include\n\
+             hl.monitor({ output = 'DP-1', mode = '1920x1080@240',\n\
+                 position = 'auto', scale = 1.25 })\n",
+        )
+        .unwrap();
+        fs::write(
+            &sourced,
+            "hl.monitor({ output = 'HDMI-A-1', mode = 'preferred', position = 'auto', scale = 1 })\n",
+        )
+        .unwrap();
+
+        let report =
+            inspect_monitor_rule_from(root, "DP-1", "monitor=DP-1,1920x1080@240,auto,1.25");
+
+        assert_eq!(report.files_read, 2);
+        assert!(report.read_warnings.is_empty());
+        assert_eq!(report.connector_rules.len(), 1);
+        assert!(report.exact_match_is_effective());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

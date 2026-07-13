@@ -22,6 +22,7 @@ use state::{
     ExportConfirmDialog, ExportDialog, ImportDialog, StandardResolutionEditor, SystemOperation,
 };
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 use support::{TerminalSession, wrap_index};
@@ -97,16 +98,23 @@ enum GlobalAction {
     VerifyMode,
     Install,
     Uninstall,
-    Ok,
-    Cancel,
 }
 
 #[derive(Debug, Clone)]
 enum PendingSystemAction {
     Install {
-        plan: InstallPlan,
+        monitor: Box<Monitor>,
+        workspace: Box<EdidWorkspace>,
+        hyprland_mode: String,
+        output_dir: PathBuf,
         operation: SystemOperation,
     },
+    Uninstall(UninstallPlan),
+}
+
+#[derive(Debug, Clone)]
+enum SystemExecution {
+    Install(InstallPlan),
     Uninstall(UninstallPlan),
 }
 
@@ -138,7 +146,6 @@ struct ModeProvenance {
 enum HitTarget {
     MonitorSelector,
     EstablishedRow(usize),
-    EstablishedCheckbox(usize),
     DetailedRow(usize),
     StandardRow(usize),
     ExtensionRow(usize),
@@ -392,19 +399,7 @@ impl App {
                     ModeKey::new(mode.width, mode.height, mode.refresh_hz(), mode.interlaced),
                     format!("CTA ext {extension_index} VIC {}", mode.vic),
                 ),
-                ExtensionRow::Dtd(row) => {
-                    if let Some(timing) = row
-                        .timing
-                        .and_then(|timing| ModeKey::from_timing(&timing).map(|key| (key, timing)))
-                    {
-                        let (key, _) = timing;
-                        push_mode_source(
-                            &mut map,
-                            key,
-                            format!("CTA ext {} DTD slot {}", row.extension_index, row.slot),
-                        );
-                    }
-                }
+                ExtensionRow::Dtd(_) => {}
                 ExtensionRow::DisplayIdDtd(row) => {
                     if let Some(key) = ModeKey::from_timing(&row.timing) {
                         push_mode_source(
@@ -620,5 +615,109 @@ fn push_mode_source(map: &mut BTreeMap<ModeKey, Vec<String>>, key: ModeKey, sour
     let sources = map.entry(key).or_default();
     if !sources.iter().any(|existing| existing == &source) {
         sources.push(source);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edid::{DtdLocation, encode_detailed_timing, parse_edid};
+    use crate::models::ConnectorStatus;
+
+    fn timing() -> TimingDescriptor {
+        TimingDescriptor {
+            pixel_clock_khz: 167_000,
+            h_active: 1600,
+            h_blanking: 160,
+            h_front_porch: 48,
+            h_sync_width: 32,
+            h_back_porch: 80,
+            v_active: 900,
+            v_blanking: 50,
+            v_front_porch: 3,
+            v_sync_width: 5,
+            v_back_porch: 42,
+            h_sync_positive: true,
+            v_sync_positive: false,
+            interlaced: false,
+        }
+    }
+
+    fn repair_checksum(block: &mut [u8]) {
+        let last = block.len() - 1;
+        block[last] = 0;
+        let sum = block[..last]
+            .iter()
+            .fold(0u8, |acc, byte| acc.wrapping_add(*byte));
+        block[last] = 0u8.wrapping_sub(sum);
+    }
+
+    fn monitor_with_cta_dtd() -> Monitor {
+        let mut raw = vec![0u8; 256];
+        raw[..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+        raw[38..54].fill(0x01);
+        raw[126] = 1;
+        repair_checksum(&mut raw[..128]);
+
+        let cta = &mut raw[128..];
+        cta[0] = 0x02;
+        cta[1] = 3;
+        cta[2] = 6;
+        cta[4] = (2 << 5) | 1;
+        cta[5] = 16;
+        cta[6..24].copy_from_slice(&encode_detailed_timing(&timing()).unwrap());
+        repair_checksum(cta);
+
+        Monitor {
+            connector: "DP-TEST".to_string(),
+            drm_path: None,
+            status: ConnectorStatus::Connected,
+            hyprland: None,
+            edid: Some(parse_edid(raw).unwrap()),
+        }
+    }
+
+    #[test]
+    fn extension_edit_resolves_cta_location_after_video_rows() {
+        let expected = timing();
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        app.selected_extension = app
+            .working_extension_rows()
+            .iter()
+            .position(|row| matches!(row, ExtensionRow::Dtd(slot) if slot.timing.is_some()));
+
+        app.edit_selected_extension_dtd();
+
+        let editor = app.detailed_editor.as_ref().expect("DTD editor");
+        assert_eq!(editor.timing().unwrap(), expected);
+        assert!(matches!(
+            editor.mode,
+            state::EditorMode::EditCta {
+                location: DtdLocation::Cta {
+                    extension_index: 1,
+                    slot: 0
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cta_dtd_has_one_provenance_source() {
+        let app = App::new(vec![monitor_with_cta_dtd()]);
+        let key = ModeKey::from_timing(&timing()).unwrap();
+
+        assert_eq!(app.mode_provenance(key).sources.len(), 1);
+    }
+
+    #[test]
+    fn apply_refuses_unchanged_workspace() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+
+        app.apply_selected_monitor();
+
+        assert!(app.pending_system_action.is_none());
+        assert!(app.apply_confirm_dialog.is_none());
+        assert!(app.status.contains("No workspace changes"));
     }
 }

@@ -5,7 +5,7 @@
 It edits monitor EDID data, exports patched EDID binaries, and can install those
 overrides on supported systems so the kernel exposes custom modes after reboot.
 Hyprland integration is included for live mode discovery, switching, verification,
-and generated `monitor=...` rules.
+and generated legacy `monitor=...` or Hyprland 0.55 Lua monitor rules.
 
 > `drmcru` is an early preview. EDID overrides affect display initialization;
 > keep a known-good mode or another way to access the system available.
@@ -79,7 +79,7 @@ new EDID mode appear.
 
 ## What It Can Edit
 
-- Established timing bits
+- Established timing inspection
 - Base-block detailed timing descriptors
 - Base-block standard timings
 - CTA-861 extension detailed timing descriptors
@@ -109,7 +109,10 @@ On the supported Limine/mkinitcpio path, Install/Update modifies:
 - `/boot/limine.conf`
 - `/etc/limine-entry-tool.d/drmcru-edid.conf` when `limine-mkinitcpio` is used
 
-It writes timestamped `.drmcru.*.bak` backups before editing config files.
+It writes collision-resistant `.drmcru.*.bak` backups before editing config and
+firmware files. Existing overrides for other connectors are retained in the same
+kernel parameter. If an install or rebuild step fails, the script restores all
+files changed by that run.
 
 ## Recovery
 
@@ -130,7 +133,13 @@ When `hyprctl` is available, `drmcru` can:
 - list Hyprland's exposed modes
 - switch to an already exposed mode
 - verify the active mode
-- inspect simple Hyprland `monitor=` rules and sourced config files
+- inspect simple legacy `monitor=` rules and sourced config files
+- inspect literal Hyprland 0.55 `hl.monitor({...})` calls and `dofile(...)` includes
+
+Generated persistent rules follow the detected config format: `hyprland.lua`
+takes precedence when present, otherwise `hyprland.conf` syntax is used. Runtime
+switching first tries the legacy keyword command and falls back to a Lua
+`hl.monitor({...})` evaluation on Hyprland 0.55.
 
 `drmcru` does not auto-edit Hyprland config.
 

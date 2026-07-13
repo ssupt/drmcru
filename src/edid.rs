@@ -21,6 +21,8 @@ pub enum EdidError {
     TimingFieldTooLarge { field: &'static str, value: u32 },
     #[error("pixel clock {0} kHz exceeds EDID's detailed timing limit")]
     PixelClockTooLarge(u32),
+    #[error("pixel clock {0} kHz is below EDID's detailed timing minimum of 10 kHz")]
+    PixelClockTooSmall(u32),
     #[error("no empty base or CTA-861 detailed timing slot is available")]
     NoAvailableDetailedTimingSlot,
     #[error("no empty standard timing slot is available")]
@@ -272,7 +274,7 @@ pub fn insert_detailed_timing(
         return Ok((patched, location));
     }
 
-    let descriptor = encode_detailed_timing(timing)?;
+    let descriptor = encode_detailed_timing_for_edid(raw, timing)?;
     let mut patched = raw.to_vec();
 
     let extension_blocks = raw[126];
@@ -357,7 +359,7 @@ pub fn insert_cta_detailed_timing(
         return Err(EdidError::NoAvailableDetailedTimingSlot);
     };
 
-    let descriptor = encode_detailed_timing(timing)?;
+    let descriptor = encode_detailed_timing_for_edid(raw, timing)?;
     let mut patched = raw.to_vec();
     let offset = block_start + relative_offset;
     patched[offset..offset + DTD_LEN].copy_from_slice(&descriptor);
@@ -376,9 +378,24 @@ pub fn patch_detailed_timing(
     location: DtdLocation,
     timing: &TimingDescriptor,
 ) -> Result<Vec<u8>, EdidError> {
-    let mut patched = raw.to_vec();
-    let descriptor = encode_detailed_timing(timing)?;
     let (offset, block_start) = dtd_offset(raw, location)?;
+    let mut descriptor = encode_detailed_timing_for_edid(raw, timing)?;
+    let existing = &raw[offset..offset + DTD_LEN];
+    if existing[0] != 0 || existing[1] != 0 {
+        descriptor[12..17].copy_from_slice(&existing[12..17]);
+        let sync_kind = existing[17] & 0x18;
+        let stereo = existing[17] & 0x61;
+        descriptor[17] = stereo
+            | sync_kind
+            | if timing.interlaced { 0x80 } else { 0 }
+            | if sync_kind == 0x18 {
+                (if timing.v_sync_positive { 0x04 } else { 0 })
+                    | (if timing.h_sync_positive { 0x02 } else { 0 })
+            } else {
+                existing[17] & 0x06
+            };
+    }
+    let mut patched = raw.to_vec();
     patched[offset..offset + DTD_LEN].copy_from_slice(&descriptor);
     repair_block_checksum(&mut patched[block_start..block_start + EDID_BLOCK_LEN]);
     Ok(patched)
@@ -514,6 +531,9 @@ pub fn encode_detailed_timing(timing: &TimingDescriptor) -> Result<[u8; DTD_LEN]
     validate_6_bit("v_sync_width", timing.v_sync_width)?;
 
     let pixel_clock_10khz = timing.pixel_clock_khz / 10;
+    if pixel_clock_10khz == 0 {
+        return Err(EdidError::PixelClockTooSmall(timing.pixel_clock_khz));
+    }
     if pixel_clock_10khz > u32::from(u16::MAX) {
         return Err(EdidError::PixelClockTooLarge(timing.pixel_clock_khz));
     }
@@ -538,6 +558,23 @@ pub fn encode_detailed_timing(timing: &TimingDescriptor) -> Result<[u8; DTD_LEN]
         | if timing.interlaced { 0x80 } else { 0 }
         | if timing.v_sync_positive { 0x04 } else { 0 }
         | if timing.h_sync_positive { 0x02 } else { 0 };
+    Ok(descriptor)
+}
+
+fn encode_detailed_timing_for_edid(
+    raw: &[u8],
+    timing: &TimingDescriptor,
+) -> Result<[u8; DTD_LEN], EdidError> {
+    let mut descriptor = encode_detailed_timing(timing)?;
+    if raw.len() >= BASE_BLOCK_LEN {
+        let h_size_mm = u16::from(raw[21]) * 10;
+        let v_size_mm = u16::from(raw[22]) * 10;
+        if h_size_mm <= 0x0fff && v_size_mm <= 0x0fff {
+            descriptor[12] = low_byte(h_size_mm);
+            descriptor[13] = low_byte(v_size_mm);
+            descriptor[14] = high_nibble(h_size_mm) << 4 | high_nibble(v_size_mm);
+        }
+    }
     Ok(descriptor)
 }
 
@@ -755,11 +792,15 @@ fn parse_displayid_type_i_dtd(
     let raw_flags = descriptor[3];
     let h_active = le_u16(&descriptor[4..6]).checked_add(1)?;
     let h_blanking = le_u16(&descriptor[6..8]).checked_add(1)?;
-    let h_front_porch = le_u16(&descriptor[8..10]).checked_add(1)?;
+    let h_front_raw = le_u16(&descriptor[8..10]);
+    let h_sync_positive = h_front_raw & 0x8000 != 0;
+    let h_front_porch = (h_front_raw & 0x7fff).checked_add(1)?;
     let h_sync_width = le_u16(&descriptor[10..12]).checked_add(1)?;
     let v_active = le_u16(&descriptor[12..14]).checked_add(1)?;
     let v_blanking = le_u16(&descriptor[14..16]).checked_add(1)?;
-    let v_front_porch = le_u16(&descriptor[16..18]).checked_add(1)?;
+    let v_front_raw = le_u16(&descriptor[16..18]);
+    let v_sync_positive = v_front_raw & 0x8000 != 0;
+    let v_front_porch = (v_front_raw & 0x7fff).checked_add(1)?;
     let v_sync_width = le_u16(&descriptor[18..20]).checked_add(1)?;
 
     let h_back_porch = h_blanking
@@ -787,8 +828,8 @@ fn parse_displayid_type_i_dtd(
             v_front_porch,
             v_sync_width,
             v_back_porch,
-            h_sync_positive: false,
-            v_sync_positive: false,
+            h_sync_positive,
+            v_sync_positive,
             interlaced: raw_flags & 0x10 != 0,
         },
     })
@@ -1426,6 +1467,53 @@ mod tests {
         let parsed = parse_detailed_timing(&descriptor).expect("timing should parse");
 
         assert_eq!(parsed, timing);
+    }
+
+    #[test]
+    fn rejects_pixel_clocks_below_dtd_resolution() {
+        let mut timing = sample_timing();
+        timing.pixel_clock_khz = 9;
+
+        assert!(matches!(
+            encode_detailed_timing(&timing),
+            Err(EdidError::PixelClockTooSmall(9))
+        ));
+    }
+
+    #[test]
+    fn inserted_dtd_uses_base_display_size() {
+        let mut edid = minimal_base_edid(0);
+        edid[21] = 60;
+        edid[22] = 34;
+        repair_block_checksum(&mut edid);
+
+        let (patched, _) = insert_detailed_timing(&edid, &sample_timing()).unwrap();
+        let descriptor = &patched[DTD_START..DTD_START + DTD_LEN];
+        let h_size = u16::from(descriptor[12]) | (u16::from(descriptor[14] & 0xf0) << 4);
+        let v_size = u16::from(descriptor[13]) | (u16::from(descriptor[14] & 0x0f) << 8);
+
+        assert_eq!((h_size, v_size), (600, 340));
+    }
+
+    #[test]
+    fn replacing_dtd_preserves_physical_metadata_and_sync_kind() {
+        let mut edid = minimal_base_edid(0);
+        edid = patch_base_detailed_timing(&edid, 0, &sample_timing()).unwrap();
+        let offset = DTD_START;
+        edid[offset + 12..offset + 17].copy_from_slice(&[0x34, 0x12, 0x56, 7, 9]);
+        edid[offset + 17] = 0x10;
+        repair_block_checksum(&mut edid);
+        let mut replacement = sample_timing();
+        replacement.h_active = 1280;
+
+        let patched =
+            patch_detailed_timing(&edid, DtdLocation::Base { slot: 0 }, &replacement).unwrap();
+
+        assert_eq!(
+            &patched[offset + 12..offset + 17],
+            &[0x34, 0x12, 0x56, 7, 9]
+        );
+        assert_eq!(patched[offset + 17] & 0x18, 0x10);
     }
 
     #[test]
