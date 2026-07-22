@@ -14,25 +14,50 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Enter => self.activate_focused(),
             KeyCode::Char('a') => match self.focus {
+                FocusArea::Detailed => self.open_detailed_editor(EditorMode::Add),
                 FocusArea::Standard => self.open_standard_editor(StandardEditorMode::Add),
                 FocusArea::Extension => self.open_extension_add_editor(),
-                _ => self.open_detailed_editor(EditorMode::Add),
+                _ => {
+                    self.status =
+                        "Focus an editable timing section before adding a mode.".to_string()
+                }
             },
             KeyCode::Char('e') => self.export_selected_monitor(),
+            KeyCode::Char('E') => match self.focus {
+                FocusArea::Detailed => self.edit_selected_detailed(),
+                FocusArea::Standard => self.edit_selected_standard(),
+                FocusArea::Extension => self.edit_selected_extension_dtd(),
+                _ => self.status = "Focus an editable timing row before editing it.".to_string(),
+            },
             KeyCode::Char('s') => self.switch_selected_monitor_mode(),
             KeyCode::Char('v') => self.verify_selected_monitor_mode(),
             KeyCode::Char('A') => self.apply_selected_monitor(),
             KeyCode::Char('u') => self.uninstall_selected_monitor(),
             KeyCode::Char('i') => self.open_selected_details(),
             KeyCode::Char('c') => match self.focus {
+                FocusArea::Detailed => self.copy_selected_detailed(),
                 FocusArea::Extension => self.copy_selected_extension_dtd(),
-                _ => self.copy_selected_detailed(),
+                FocusArea::Standard => {
+                    self.status =
+                        "Standard timings cannot be copied as full detailed timings.".to_string()
+                }
+                _ => {
+                    self.status =
+                        "Focus a detailed or CTA timing row before copying it.".to_string()
+                }
             },
-            KeyCode::Char('p') => self.paste_detailed_as_new(),
+            KeyCode::Char('p') => match self.focus {
+                FocusArea::Detailed | FocusArea::Extension => self.paste_detailed_as_new(),
+                _ => {
+                    self.status =
+                        "Focus the detailed or CTA timing pane before pasting a mode.".to_string()
+                }
+            },
             KeyCode::Delete | KeyCode::Char('d') => match self.focus {
+                FocusArea::Detailed => self.delete_selected_detailed(),
                 FocusArea::Standard => self.delete_selected_standard(),
                 FocusArea::Extension => self.delete_selected_extension_dtd(),
-                _ => self.delete_selected_detailed(),
+                _ => self.status = "Focus an editable timing row before deleting it.".to_string(),
             },
             _ => {}
         }

@@ -15,6 +15,8 @@ pub enum DiscoveryError {
     Io(#[from] io::Error),
     #[error("failed to parse Hyprland monitor JSON: {0}")]
     HyprlandJson(#[from] serde_json::Error),
+    #[error("failed to parse Hyprland version JSON: {0}")]
+    HyprlandVersionJson(serde_json::Error),
 }
 
 #[derive(Debug, Error)]
@@ -47,16 +49,23 @@ pub fn discover_monitors_from(sysfs_drm_root: &Path) -> Result<Vec<Monitor>, Dis
 
             let status = read_connector_status(&path).unwrap_or(ConnectorStatus::Unknown);
             let edid = read_edid(&path).ok();
-            connectors.insert(
-                connector.clone(),
-                Monitor {
-                    connector,
-                    drm_path: Some(path),
-                    status,
-                    hyprland: None,
-                    edid,
-                },
-            );
+            let candidate = Monitor {
+                connector: connector.clone(),
+                drm_path: Some(path),
+                status,
+                hyprland: None,
+                edid,
+            };
+            match connectors.entry(connector) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if monitor_sort_rank(&candidate) < monitor_sort_rank(entry.get()) {
+                        entry.insert(candidate);
+                    }
+                }
+            }
         }
     }
 
@@ -66,7 +75,7 @@ pub fn discover_monitors_from(sysfs_drm_root: &Path) -> Result<Vec<Monitor>, Dis
         .cloned()
         .collect::<BTreeSet<_>>();
 
-    let monitors = all_names
+    let mut monitors = all_names
         .into_iter()
         .map(|name| {
             let mut monitor = connectors.remove(&name).unwrap_or(Monitor {
@@ -79,9 +88,37 @@ pub fn discover_monitors_from(sysfs_drm_root: &Path) -> Result<Vec<Monitor>, Dis
             monitor.hyprland = hypr_by_name.get(&name).cloned();
             monitor
         })
-        .collect();
+        .collect::<Vec<_>>();
+    monitors.sort_by(|left, right| {
+        monitor_sort_rank(left)
+            .cmp(&monitor_sort_rank(right))
+            .then_with(|| left.connector.cmp(&right.connector))
+    });
 
     Ok(monitors)
+}
+
+fn monitor_sort_rank(monitor: &Monitor) -> u8 {
+    if monitor
+        .hyprland
+        .as_ref()
+        .is_some_and(|hyprland| hyprland.focused)
+    {
+        0
+    } else {
+        match (
+            monitor.status,
+            monitor.edid.is_some(),
+            monitor.hyprland.is_some(),
+        ) {
+            (ConnectorStatus::Connected, true, _) => 1,
+            (ConnectorStatus::Connected, false, _) => 2,
+            (_, true, _) => 3,
+            (_, _, true) => 4,
+            (ConnectorStatus::Unknown, false, false) => 5,
+            (ConnectorStatus::Disconnected, false, false) => 6,
+        }
+    }
 }
 
 pub fn read_raw_edid(connector_path: &Path) -> io::Result<Vec<u8>> {
@@ -95,6 +132,20 @@ pub fn read_edid(connector_path: &Path) -> Result<crate::models::EdidData, EdidR
         source,
     })?;
     parse_edid(raw).map_err(EdidReadError::Parse)
+}
+
+pub fn hyprland_version() -> Result<Option<String>, DiscoveryError> {
+    let Ok(output) = Command::new("hyprctl").args(["version", "-j"]).output() else {
+        return Ok(None);
+    };
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(None);
+    }
+
+    let version = serde_json::from_slice::<HyprlandVersionJson>(&output.stdout)
+        .map_err(DiscoveryError::HyprlandVersionJson)?;
+    Ok((!version.version.is_empty()).then_some(version.version))
 }
 
 fn read_connector_status(connector_path: &Path) -> io::Result<ConnectorStatus> {
@@ -151,6 +202,11 @@ struct HyprlandMonitorJson {
     focused: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HyprlandVersionJson {
+    version: String,
+}
+
 impl From<HyprlandMonitorJson> for HyprlandMonitor {
     fn from(value: HyprlandMonitorJson) -> Self {
         Self {
@@ -187,4 +243,52 @@ fn is_connector_dir(path: &Path) -> bool {
 #[allow(dead_code)]
 fn connector_sysfs_path(root: &Path, card: &str, connector: &str) -> PathBuf {
     root.join(format!("{card}-{connector}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(connector: &str, status: ConnectorStatus, focused: bool) -> Monitor {
+        Monitor {
+            connector: connector.to_string(),
+            drm_path: None,
+            status,
+            hyprland: focused.then(|| HyprlandMonitor {
+                id: Some(1),
+                name: connector.to_string(),
+                description: String::new(),
+                make: None,
+                model: None,
+                serial: None,
+                active_width: Some(1920),
+                active_height: Some(1080),
+                refresh_hz: Some(60.0),
+                x: Some(0),
+                y: Some(0),
+                scale: Some(1.0),
+                available_modes: Vec::new(),
+                focused: true,
+            }),
+            edid: None,
+        }
+    }
+
+    #[test]
+    fn focused_and_connected_monitors_sort_before_disconnected_ports() {
+        let focused = monitor("HDMI-A-1", ConnectorStatus::Connected, true);
+        let connected = monitor("eDP-1", ConnectorStatus::Connected, false);
+        let disconnected = monitor("DP-1", ConnectorStatus::Disconnected, false);
+
+        assert!(monitor_sort_rank(&focused) < monitor_sort_rank(&connected));
+        assert!(monitor_sort_rank(&connected) < monitor_sort_rank(&disconnected));
+    }
+
+    #[test]
+    fn connected_duplicate_connector_beats_disconnected_one() {
+        let connected = monitor("DP-1", ConnectorStatus::Connected, false);
+        let disconnected = monitor("DP-1", ConnectorStatus::Disconnected, false);
+
+        assert!(monitor_sort_rank(&connected) < monitor_sort_rank(&disconnected));
+    }
 }

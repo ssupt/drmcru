@@ -108,13 +108,17 @@ pub fn export_instructions(edid_path: &Path, plan: &ExportPlan) -> String {
             shell_quote(&edid_path.to_string_lossy())
         ),
         String::new(),
-        "2. Add this kernel parameter to your bootloader:".to_string(),
+        "2. Ensure the EDID is available in the early initramfs.".to_string(),
+        "   With mkinitcpio, add the install target above to FILES in /etc/mkinitcpio.conf."
+            .to_string(),
+        String::new(),
+        "3. Add this kernel parameter to your bootloader:".to_string(),
         format!("   {}", plan.drm_kernel_parameter()),
         String::new(),
-        "3. Add or update this Hyprland monitor rule:".to_string(),
+        "4. Add or update this Hyprland monitor rule:".to_string(),
         format!("   {}", plan.hyprland_monitor_rule()),
         String::new(),
-        "4. Rebuild your bootloader/initramfs as required by your distribution, then reboot."
+        "5. Rebuild your bootloader/initramfs as required by your distribution, then reboot."
             .to_string(),
     ]
     .join("\n")
@@ -260,6 +264,7 @@ mod tests {
         let instructions = export_instructions(Path::new("/tmp/drmcru_custom_DP-1.bin"), &plan);
 
         assert!(instructions.contains("sudo install -D -m 0644"));
+        assert!(instructions.contains("FILES in /etc/mkinitcpio.conf"));
         assert!(instructions.contains("drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin"));
         assert!(instructions.contains("monitor=DP-1,1920x1080@"));
         assert!(instructions.contains(",auto,1"));

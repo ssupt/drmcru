@@ -2,19 +2,27 @@ use crate::discovery;
 use crate::export::custom_edid_file_name;
 use crate::hyprland_config;
 use crate::install::{self, InstalledOverrideStatus, SystemSupportReport, UninstallPlan};
-use crate::models::Monitor;
+use crate::models::{ConnectorStatus, Monitor};
 use crate::validation::internal_panel_scaling_warning;
 use anyhow::Result;
 
 pub fn run() -> Result<()> {
     let monitors = discovery::discover_monitors()?;
+    let hyprland_version = match discovery::hyprland_version() {
+        Ok(Some(version)) => version,
+        Ok(None) => "not reachable".to_string(),
+        Err(error) => format!("unknown ({error})"),
+    };
     let support = install::inspect_system_support();
     let overrides = monitors
         .iter()
         .map(|monitor| inspect_connector_override(&monitor.connector))
         .collect::<Vec<_>>();
 
-    println!("{}", report_text(&monitors, &support, &overrides));
+    println!(
+        "{}",
+        report_text(&monitors, &support, &overrides, &hyprland_version)
+    );
     Ok(())
 }
 
@@ -22,10 +30,12 @@ fn report_text(
     monitors: &[Monitor],
     support: &SystemSupportReport,
     overrides: &[InstalledOverrideStatus],
+    hyprland_version: &str,
 ) -> String {
     let mut lines = vec![
         format!("drmcru {}", env!("CARGO_PKG_VERSION")),
         "Doctor report".to_string(),
+        format!("Hyprland: {hyprland_version}"),
         String::new(),
         "System support".to_string(),
     ];
@@ -108,6 +118,13 @@ fn report_text(
             }
         } else {
             lines.push("   EDID: unavailable".to_string());
+            if monitor.status != ConnectorStatus::Disconnected {
+                if let Some(path) = &monitor.drm_path {
+                    if let Err(error) = discovery::read_edid(path) {
+                        lines.push(format!("   EDID error: {error}"));
+                    }
+                }
+            }
         }
 
         if let Some(status) = overrides.get(index) {
@@ -143,22 +160,27 @@ fn report_text(
                 config.connector_rules.len()
             ));
             if let Some(last) = &config.last_connector_rule {
-                lines.push(format!("   Hyprland config winner: {}", last.location()));
+                lines.push(format!(
+                    "   Hyprland last literal rule: {}",
+                    last.location()
+                ));
                 lines.push(format!(
                     "   Hyprland config mode: {}",
                     last.normalized_rule()
                 ));
-                if let Some(hyprland) = &monitor.hyprland
-                    && let Some(requested) = parse_mode_request(&last.mode)
-                    && !hyprland
-                        .available_modes
-                        .iter()
-                        .any(|mode| available_mode_matches_request(mode, requested))
-                {
-                    lines.push(format!(
-                        "   Hyprland config warning: requested mode {} is not currently exposed",
-                        last.mode
-                    ));
+                if let Some(hyprland) = &monitor.hyprland {
+                    if let Some(requested) = parse_mode_request(&last.mode) {
+                        if !hyprland
+                            .available_modes
+                            .iter()
+                            .any(|mode| available_mode_matches_request(mode, requested))
+                        {
+                            lines.push(format!(
+                                "   Hyprland config warning: requested mode {} is not currently exposed",
+                                last.mode
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -272,8 +294,14 @@ mod tests {
             }),
         };
 
-        let report = report_text(&[monitor], &sample_support(), &[sample_override()]);
+        let report = report_text(
+            &[monitor],
+            &sample_support(),
+            &[sample_override()],
+            "0.56.0",
+        );
 
+        assert!(report.contains("Hyprland: 0.56.0"));
         assert!(report.contains("Automatic Apply: supported"));
         assert!(report.contains("1. DP-1"));
         assert!(report.contains("EDID name: Test Monitor"));

@@ -1,3 +1,4 @@
+use crate::hyprland_config;
 use serde::Deserialize;
 use std::io;
 use std::process::Command;
@@ -126,11 +127,16 @@ pub fn switch_to_available_mode(
     }
 
     let argument = before.monitor_argument(connector, &mode_label);
-    let monitor_rule = format!("monitor={argument}");
+    let monitor_rule = before.monitor_rule(connector, &mode_label);
     let output = apply_monitor_argument(&argument)?;
 
-    thread::sleep(Duration::from_millis(150));
-    let actual = active_mode_for_connector(connector)?;
+    let actual = match wait_for_requested_mode(connector, requested) {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = apply_monitor_argument(&before.restore_argument(connector));
+            return Err(error);
+        }
+    };
     let matched = actual
         .as_ref()
         .map(|actual| {
@@ -238,6 +244,57 @@ fn active_mode_for_connector(connector: &str) -> Result<Option<RuntimeModeActual
     Ok(live_monitor(connector)?.map(|monitor| monitor.actual_mode()))
 }
 
+fn wait_for_requested_mode(
+    connector: &str,
+    requested: &ModeRequest,
+) -> Result<Option<RuntimeModeActual>, HyprlandError> {
+    poll_requested_mode(requested, 20, Duration::from_millis(100), || {
+        active_mode_for_connector(connector)
+    })
+}
+
+fn poll_requested_mode<F>(
+    requested: &ModeRequest,
+    attempts: usize,
+    delay: Duration,
+    mut read_mode: F,
+) -> Result<Option<RuntimeModeActual>, HyprlandError>
+where
+    F: FnMut() -> Result<Option<RuntimeModeActual>, HyprlandError>,
+{
+    let attempts = attempts.max(1);
+    let mut latest = None;
+    let mut successful_read = false;
+    let mut last_error = None;
+
+    for attempt in 0..attempts {
+        match read_mode() {
+            Ok(actual) => {
+                successful_read = true;
+                latest = actual;
+                if latest.as_ref().is_some_and(|actual| {
+                    mode_matches_request(actual.width, actual.height, actual.refresh_hz, requested)
+                }) {
+                    return Ok(latest);
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+
+        if attempt + 1 < attempts {
+            thread::sleep(delay);
+        }
+    }
+
+    if successful_read {
+        Ok(latest)
+    } else {
+        Err(last_error.unwrap_or_else(|| {
+            HyprlandError::MonitorNotFound("mode verification returned no result".to_string())
+        }))
+    }
+}
+
 fn live_monitor(connector: &str) -> Result<Option<HyprlandMonitorJson>, HyprlandError> {
     let output = Command::new("hyprctl")
         .args(["monitors", "-j"])
@@ -314,7 +371,12 @@ impl HyprlandMonitorJson {
     }
 
     fn monitor_rule(&self, connector: &str, mode_label: &str) -> String {
-        format!("monitor={}", self.monitor_argument(connector, mode_label))
+        hyprland_config::format_monitor_rule(
+            connector,
+            mode_label,
+            &self.position_string(),
+            &self.scale_string(),
+        )
     }
 
     fn mode_label_for_request(&self, requested: &ModeRequest) -> Option<String> {
@@ -501,8 +563,52 @@ mod tests {
     fn monitor_rule_uses_full_hyprland_syntax() {
         assert_eq!(
             sample_live_monitor().monitor_rule("DP-1", "1280x1080@239.76"),
-            "monitor=DP-1,1280x1080@239.76,2560x0,1.25"
+            hyprland_config::format_monitor_rule("DP-1", "1280x1080@239.76", "2560x0", "1.25")
         );
+    }
+
+    #[test]
+    fn mode_polling_waits_through_transient_old_and_missing_states() {
+        let requested = ModeRequest::new(1280, 1080, 239.76);
+        let mut reads = vec![
+            Some(RuntimeModeActual {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 144.0,
+            }),
+            None,
+            Some(RuntimeModeActual {
+                width: 1280,
+                height: 1080,
+                refresh_hz: 239.761,
+            }),
+        ]
+        .into_iter();
+        let mut calls = 0;
+
+        let actual = poll_requested_mode(&requested, 5, Duration::ZERO, || {
+            calls += 1;
+            Ok(reads.next().flatten())
+        })
+        .unwrap();
+
+        assert_eq!(calls, 3);
+        assert!(actual.is_some_and(|actual| actual.width == 1280));
+    }
+
+    #[test]
+    fn mode_polling_returns_latest_mismatch_after_timeout() {
+        let requested = ModeRequest::new(1280, 1080, 239.76);
+        let actual = poll_requested_mode(&requested, 3, Duration::ZERO, || {
+            Ok(Some(RuntimeModeActual {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 144.0,
+            }))
+        })
+        .unwrap();
+
+        assert_eq!(actual.unwrap().width, 1920);
     }
 
     #[test]
@@ -545,7 +651,12 @@ mod tests {
         assert!(inspection.active_matches());
         assert_eq!(
             inspection.monitor_rule,
-            Some("monitor=DP-1,1920x1080@144,2560x0,1.25".to_string())
+            Some(hyprland_config::format_monitor_rule(
+                "DP-1",
+                "1920x1080@144",
+                "2560x0",
+                "1.25"
+            ))
         );
     }
 

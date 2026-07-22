@@ -680,6 +680,8 @@ BACKUP_SUFFIX=".drmcru.$(date +%Y%m%d-%H%M%S-%N)-$$.bak"
 declare -a BACKUP_ORIGINALS=()
 declare -a BACKUP_PATHS=()
 FIRMWARE_WAS_PRESENT=0
+LIMINE_DROPIN_WAS_PRESENT=0
+LIMINE_DROPIN_DIR_WAS_PRESENT=0
 
 backup_file() {{
     local file="$1"
@@ -700,6 +702,12 @@ rollback() {{
     done
     if [ "$FIRMWARE_WAS_PRESENT" -eq 0 ]; then
         rm -f -- "$FIRMWARE_TARGET" || true
+    fi
+    if [ "$LIMINE_DROPIN_WAS_PRESENT" -eq 0 ]; then
+        rm -f -- "$LIMINE_DROPIN" || true
+    fi
+    if [ "$LIMINE_DROPIN_DIR_WAS_PRESENT" -eq 0 ]; then
+        rmdir -- "$LIMINE_DROPIN_DIR" 2>/dev/null || true
     fi
     exit "$status"
 }}
@@ -737,6 +745,12 @@ fi
 if [ -e "$FIRMWARE_TARGET" ]; then
     FIRMWARE_WAS_PRESENT=1
     backup_file "$FIRMWARE_TARGET"
+fi
+if [ -e "$LIMINE_DROPIN" ]; then
+    LIMINE_DROPIN_WAS_PRESENT=1
+fi
+if [ -d "$LIMINE_DROPIN_DIR" ]; then
+    LIMINE_DROPIN_DIR_WAS_PRESENT=1
 fi
 trap rollback ERR
 
@@ -1369,6 +1383,15 @@ mod tests {
         assert!(script.contains("backup_file \"$MKINIT\""));
         assert!(script.contains("backup_file \"$LIMINE\""));
         assert!(script.contains("backup_file \"$LIMINE_DROPIN\""));
+    }
+
+    #[test]
+    fn install_rollback_removes_new_limine_dropin() {
+        let script = build_install_script(&sample_plan());
+
+        assert!(script.contains("LIMINE_DROPIN_WAS_PRESENT=0"));
+        assert!(script.contains("rm -f -- \"$LIMINE_DROPIN\" || true"));
+        assert!(script.contains("rmdir -- \"$LIMINE_DROPIN_DIR\""));
     }
 
     #[test]

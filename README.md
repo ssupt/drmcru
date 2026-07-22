@@ -5,7 +5,7 @@
 It edits monitor EDID data, exports patched EDID binaries, and can install those
 overrides on supported systems so the kernel exposes custom modes after reboot.
 Hyprland integration is included for live mode discovery, switching, verification,
-and generated legacy `monitor=...` or Hyprland 0.55 Lua monitor rules.
+and generated legacy `monitor=...` or Hyprland 0.55+ Lua monitor rules.
 
 > `drmcru` is an early preview. EDID overrides affect display initialization;
 > keep a known-good mode or another way to access the system available.
@@ -16,7 +16,7 @@ and generated legacy `monitor=...` or Hyprland 0.55 Lua monitor rules.
 
 This release has been tested on:
 
-- Hyprland with NVIDIA DRM
+- Hyprland 0.56.0 with NVIDIA DRM
 - external DisplayPort and internal eDP discovery
 - Limine with `limine-mkinitcpio`
 
@@ -34,13 +34,15 @@ yay -S drmcru-bin
 ```
 
 Download the portable x86-64 binary from the
-[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.2):
+[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.3):
 
 ```sh
-curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.2/drmcru-0.1.2-x86_64-unknown-linux-musl
-chmod +x drmcru-0.1.2-x86_64-unknown-linux-musl
-./drmcru-0.1.2-x86_64-unknown-linux-musl doctor
-./drmcru-0.1.2-x86_64-unknown-linux-musl
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.3/drmcru-0.1.3-x86_64-unknown-linux-musl
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.3/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+chmod +x drmcru-0.1.3-x86_64-unknown-linux-musl
+./drmcru-0.1.3-x86_64-unknown-linux-musl doctor
+./drmcru-0.1.3-x86_64-unknown-linux-musl
 ```
 
 The TUI and manual Export work on Linux systems that expose connectors through
@@ -49,6 +51,10 @@ discovery, switching, and verification.
 
 Automatic Install/Update/Uninstall currently requires `pkexec`, Limine,
 mkinitcpio, and either `limine-mkinitcpio` or mkinitcpio presets.
+
+Run `drmcru` as your normal desktop user, not with `sudo`. It requests only the
+privileged Apply/Uninstall step through `pkexec`; running the whole TUI as root
+can hide the active Hyprland session and create root-owned exports.
 
 ## Build From Source
 
@@ -136,6 +142,24 @@ entry. Then run `drmcru`, choose Uninstall, and reboot. Automatic changes to
 `mkinitcpio.conf` and `limine.conf` have timestamped backups beside the original
 files.
 
+## First-run troubleshooting
+
+- Run `drmcru doctor` first and include its output when reporting a problem. It
+  reports the drmcru and Hyprland versions, detected connectors, EDID state, and
+  whether automatic Apply is supported.
+- A newly added mode will not appear in Hyprland until the kernel boots with the
+  EDID override. Install or manually configure the override, reboot, then Verify.
+- Automatic Apply intentionally stops on unsupported bootloader/initramfs setups.
+  Export still produces the EDID plus distribution-neutral manual instructions.
+- Run the TUI in an interactive terminal (80×24 or larger is recommended). For
+  scripts, redirected output, or support logs, use `drmcru doctor` instead.
+- If `pkexec` is installed but no authentication prompt appears, make sure a
+  polkit authentication agent is running in the desktop session.
+- Internal eDP panels often cannot scale arbitrary smaller scanouts. Prefer the
+  panel's native active resolution and change only its refresh timing.
+- Use `drmcru demo` to check terminal rendering and controls without reading or
+  modifying real monitor data.
+
 ## Hyprland
 
 When `hyprctl` is available, `drmcru` can:
@@ -145,14 +169,24 @@ When `hyprctl` is available, `drmcru` can:
 - switch to an already exposed mode
 - verify the active mode
 - inspect simple legacy `monitor=` rules and sourced config files
-- inspect literal Hyprland 0.55 `hl.monitor({...})` calls and `dofile(...)` includes
+- inspect literal Hyprland 0.55+ `hl.monitor({...})` calls
+- follow literal local `dofile(...)` and `require("hypr.monitors")`-style modules
 
 Generated persistent rules follow the detected config format: `hyprland.lua`
 takes precedence when present, otherwise `hyprland.conf` syntax is used. Runtime
 switching first tries the legacy keyword command and falls back to a Lua
-`hl.monitor({...})` evaluation on Hyprland 0.55.
+`hl.monitor({...})` evaluation on Hyprland 0.55 and newer.
+
+Dynamic Lua expressions are not executed during config inspection. This keeps
+diagnostics read-only; literal user monitor modules are followed in load order.
 
 `drmcru` does not auto-edit Hyprland config.
+
+## Feedback
+
+Use the repository's bug or hardware-report issue templates when testing a new
+GPU, monitor, connector, bootloader, or initramfs stack. `drmcru doctor` output
+is the most useful starting point.
 
 ## License
 

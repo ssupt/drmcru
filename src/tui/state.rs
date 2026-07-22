@@ -446,8 +446,7 @@ impl DetailedResolutionEditor {
             return;
         }
         let input = self.input_mut(field);
-        let clicked = usize::from(column.saturating_sub(rect.x)).saturating_sub(left_padding);
-        input.cursor = clicked.min(input.buffer.len());
+        input.set_cursor_from_column(column, rect, left_padding);
     }
 
     pub(super) fn move_cursor_left(&mut self) {
@@ -961,8 +960,7 @@ impl StandardResolutionEditor {
             EditorField::Refresh => &mut self.refresh,
             _ => &mut self.width,
         };
-        let clicked = usize::from(column.saturating_sub(rect.x)).saturating_sub(left_padding);
-        input.cursor = clicked.min(input.buffer.len());
+        input.set_cursor_from_column(column, rect, left_padding);
     }
 
     pub(super) fn move_cursor_left(&mut self) {
@@ -1118,24 +1116,28 @@ impl TextInput {
     }
 
     pub(super) fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            self.buffer.remove(self.cursor);
+        if let Some(previous) = previous_char_boundary(&self.buffer, self.cursor) {
+            self.buffer.drain(previous..self.cursor);
+            self.cursor = previous;
         }
     }
 
     pub(super) fn delete(&mut self) {
-        if self.cursor < self.buffer.len() {
-            self.buffer.remove(self.cursor);
+        if let Some(next) = next_char_boundary(&self.buffer, self.cursor) {
+            self.buffer.drain(self.cursor..next);
         }
     }
 
     pub(super) fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        if let Some(previous) = previous_char_boundary(&self.buffer, self.cursor) {
+            self.cursor = previous;
+        }
     }
 
     pub(super) fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.buffer.len());
+        if let Some(next) = next_char_boundary(&self.buffer, self.cursor) {
+            self.cursor = next;
+        }
     }
 
     pub(super) fn move_end(&mut self) {
@@ -1144,6 +1146,56 @@ impl TextInput {
 
     pub(super) fn set_cursor_from_column(&mut self, column: u16, rect: Rect, left_padding: usize) {
         let clicked = usize::from(column.saturating_sub(rect.x)).saturating_sub(left_padding);
-        self.cursor = clicked.min(self.buffer.len());
+        self.cursor = self
+            .buffer
+            .char_indices()
+            .nth(clicked)
+            .map(|(index, _)| index)
+            .unwrap_or(self.buffer.len());
+    }
+}
+
+fn previous_char_boundary(value: &str, cursor: usize) -> Option<usize> {
+    value[..cursor]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+}
+
+fn next_char_boundary(value: &str, cursor: usize) -> Option<usize> {
+    value[cursor..]
+        .chars()
+        .next()
+        .map(|character| cursor + character.len_utf8())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_input_moves_and_deletes_on_unicode_boundaries() {
+        let mut input = TextInput::new("éx".to_string());
+
+        input.move_left();
+        assert_eq!(input.cursor, "é".len());
+        input.backspace();
+        assert_eq!(input.buffer, "x");
+        assert_eq!(input.cursor, 0);
+        assert!(input.buffer.is_char_boundary(input.cursor));
+        input.delete();
+        assert_eq!(input.buffer, "");
+        assert!(input.render(true).contains('|'));
+    }
+
+    #[test]
+    fn text_input_mouse_cursor_uses_character_indexes() {
+        let mut input = TextInput::new("écran".to_string());
+        let rect = Rect::new(0, 0, 20, 1);
+
+        input.set_cursor_from_column(1, rect, 0);
+
+        assert_eq!(input.cursor, "é".len());
+        assert!(input.buffer.is_char_boundary(input.cursor));
     }
 }

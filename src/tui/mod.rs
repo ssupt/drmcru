@@ -165,7 +165,7 @@ struct Hitbox {
 
 impl App {
     pub fn new(monitors: Vec<Monitor>) -> Self {
-        let workspaces = monitors
+        let workspaces: Vec<Option<EdidWorkspace>> = monitors
             .iter()
             .map(|monitor| {
                 monitor
@@ -178,6 +178,17 @@ impl App {
             .iter()
             .map(|monitor| inspect_connector_override(&monitor.connector))
             .collect();
+
+        let status = if monitors.is_empty() {
+            "No DRM connectors found under /sys/class/drm. Run drmcru doctor for details."
+                .to_string()
+        } else if workspaces.iter().all(Option::is_none) {
+            "No readable monitor EDID found. Select a connector or run drmcru doctor for details."
+                .to_string()
+        } else {
+            "Add/Edit timings, switch exposed modes, or install EDID overrides. Press ? for help."
+                .to_string()
+        };
 
         Self {
             monitors,
@@ -212,9 +223,7 @@ impl App {
             pending_system_action: None,
             install_receiver: None,
             hitboxes: Vec::new(),
-            status:
-                "Add/Edit timings, switch exposed modes, or install EDID overrides. Press ? for help."
-                    .to_string(),
+            status,
         }
     }
 
@@ -489,52 +498,51 @@ impl App {
             .selected_edid()
             .map(|edid| edid.established_timings.len())
             .unwrap_or_default();
-        if len == 0 {
-            return;
-        }
-        let current = self.selected_established.unwrap_or(0);
-        self.selected_established = Some(wrap_index(current, len, delta));
+        self.selected_established = next_list_selection(self.selected_established, len, delta);
     }
 
     fn move_detailed(&mut self, delta: isize) {
         let len = self.working_dtds().len();
-        if len == 0 {
-            self.selected_detailed = None;
-            return;
-        }
-        let current = self.selected_detailed.unwrap_or(0);
-        self.selected_detailed = Some(wrap_index(current, len, delta));
+        self.selected_detailed = next_list_selection(self.selected_detailed, len, delta);
     }
 
     fn move_standard(&mut self, delta: isize) {
         let len = self.working_standard_timings().len();
-        if len == 0 {
-            self.selected_standard = None;
-            return;
-        }
-        let current = self.selected_standard.unwrap_or(0);
-        self.selected_standard = Some(wrap_index(current, len, delta));
+        self.selected_standard = next_list_selection(self.selected_standard, len, delta);
     }
 
     fn move_extension(&mut self, delta: isize) {
         let len = self.working_extension_rows().len();
-        if len == 0 {
-            self.selected_extension = None;
-            return;
-        }
-        let current = self.selected_extension.unwrap_or(0);
-        self.selected_extension = Some(wrap_index(current, len, delta));
+        self.selected_extension = next_list_selection(self.selected_extension, len, delta);
     }
 
     fn activate_focused(&mut self) {
         match self.focus {
+            FocusArea::Monitor => self.move_monitor(1),
+            FocusArea::Established => self.open_selected_details(),
+            FocusArea::Detailed if self.selected_detailed.is_some() => {
+                self.edit_selected_detailed()
+            }
             FocusArea::Detailed => self.open_detailed_editor(state::EditorMode::Add),
+            FocusArea::Standard if self.selected_standard.is_some() => {
+                self.edit_selected_standard()
+            }
             FocusArea::Standard => self.open_standard_editor(state::StandardEditorMode::Add),
             FocusArea::Extension => self.activate_extension_default(),
             FocusArea::Global => self.export_selected_monitor(),
-            _ => {}
         }
     }
+}
+
+fn next_list_selection(current: Option<usize>, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        Some(current) => wrap_index(current, len, delta),
+        None if delta < 0 => len - 1,
+        None => 0,
+    })
 }
 
 fn keep_selected_visible(
@@ -719,5 +727,65 @@ mod tests {
         assert!(app.pending_system_action.is_none());
         assert!(app.apply_confirm_dialog.is_none());
         assert!(app.status.contains("No workspace changes"));
+    }
+
+    #[test]
+    fn empty_discovery_has_actionable_first_run_status() {
+        let app = App::new(Vec::new());
+
+        assert!(app.status.contains("No DRM connectors"));
+        assert!(app.status.contains("drmcru doctor"));
+    }
+
+    #[test]
+    fn enter_edits_a_selected_detailed_timing() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        app.focus = FocusArea::Detailed;
+        app.selected_detailed = Some(0);
+
+        app.activate_focused();
+
+        assert!(app.detailed_editor.is_some());
+        assert!(matches!(
+            app.detailed_editor.as_ref().map(|editor| editor.mode),
+            Some(state::EditorMode::Edit { .. })
+        ));
+    }
+
+    #[test]
+    fn first_keyboard_movement_selects_the_nearest_row() {
+        assert_eq!(next_list_selection(None, 4, 1), Some(0));
+        assert_eq!(next_list_selection(None, 4, -1), Some(3));
+        assert_eq!(next_list_selection(None, 0, 1), None);
+    }
+
+    #[test]
+    fn import_paths_expand_home_and_terminal_quotes() {
+        let home = PathBuf::from("/home/example");
+
+        assert_eq!(
+            actions::normalize_import_path("~/Downloads/display.bin", Some(&home)),
+            home.join("Downloads/display.bin")
+        );
+        assert_eq!(
+            actions::normalize_import_path("'/tmp/display file.bin'", Some(&home)),
+            PathBuf::from("/tmp/display file.bin")
+        );
+    }
+
+    #[test]
+    fn export_validation_errors_cannot_be_bypassed() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        app.draft_timing.pixel_clock_khz = 0;
+
+        app.export_selected_monitor();
+
+        assert!(app.export_confirm_dialog.is_none());
+        assert!(
+            app.details_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.title == "Export Blocked")
+        );
+        assert!(app.status.contains("blocked"));
     }
 }

@@ -17,12 +17,12 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo package --allow-dirty --no-verify --offline
-cargo build --release --locked
+cargo build --release --locked --target "$target_triple"
 
 binary_path="${dist_dir}/${pkgname}-${version}-${target_triple}"
 checksums="${dist_dir}/SHA256SUMS"
 
-cp "target/release/${pkgname}" "$binary_path"
+cp "target/${target_triple}/release/${pkgname}" "$binary_path"
 
 (
     cd "$dist_dir"

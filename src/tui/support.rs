@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -6,7 +6,7 @@ use crossterm::terminal::{
 };
 use ratatui::CompletedFrame;
 use ratatui::prelude::*;
-use std::io;
+use std::io::{self, IsTerminal};
 
 pub(super) fn inner_rect(area: Rect) -> Rect {
     Rect {
@@ -73,10 +73,22 @@ pub(super) struct TerminalSession {
 
 impl TerminalSession {
     pub(super) fn enter() -> Result<Self> {
+        require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            return Err(error.into());
+        }
+        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+                return Err(error.into());
+            }
+        };
         Ok(Self { terminal })
     }
 
@@ -88,6 +100,15 @@ impl TerminalSession {
     }
 }
 
+fn require_interactive_terminal(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Result<()> {
+    if !stdin_is_terminal || !stdout_is_terminal {
+        bail!(
+            "the drmcru TUI requires an interactive terminal; run `drmcru doctor` for noninteractive diagnostics"
+        );
+    }
+    Ok(())
+}
+
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
@@ -97,5 +118,18 @@ impl Drop for TerminalSession {
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noninteractive_sessions_get_an_actionable_error() {
+        let error = require_interactive_terminal(false, true).unwrap_err();
+
+        assert!(error.to_string().contains("interactive terminal"));
+        assert!(error.to_string().contains("drmcru doctor"));
     }
 }

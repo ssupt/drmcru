@@ -18,7 +18,7 @@ impl App {
 
         let [top_bar, main_area, status_bar, bottom_bar] = Layout::vertical([
             Constraint::Length(3),
-            Constraint::Min(18),
+            Constraint::Min(16),
             Constraint::Length(2),
             Constraint::Length(3),
         ])

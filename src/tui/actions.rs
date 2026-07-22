@@ -15,7 +15,7 @@ use crate::models::{CtaVideoDescriptor, StandardTiming, StandardTimingAspect};
 use crate::validation::{TimingWarningSeverity, internal_panel_scaling_warning, validate_timing};
 use crate::workspace::{EdidWorkspace, MoveDirection, format_location};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 struct SwitchModeCandidate {
@@ -605,10 +605,10 @@ impl App {
 
         let mut deleted = 0usize;
         for location in locations {
-            if let Some(workspace) = self.selected_workspace_mut()
-                && workspace.delete_dtd(location).is_ok()
-            {
-                deleted += 1;
+            if let Some(workspace) = self.selected_workspace_mut() {
+                if workspace.delete_dtd(location).is_ok() {
+                    deleted += 1;
+                }
             }
         }
         self.selected_extension = None;
@@ -873,7 +873,10 @@ impl App {
         let Some(dialog) = &self.import_dialog else {
             return;
         };
-        let path = PathBuf::from(dialog.path.buffer.trim());
+        let path = normalize_import_path(
+            dialog.path.buffer.trim(),
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        );
         if path.as_os_str().is_empty() {
             self.status = "Import path is empty.".to_string();
             return;
@@ -914,6 +917,30 @@ impl App {
 
     pub(super) fn export_selected_monitor(&mut self) {
         let issues = self.export_validation_issues();
+        let blocking = issues
+            .iter()
+            .filter(|issue| issue.starts_with("Error:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !blocking.is_empty() {
+            self.detailed_editor = None;
+            self.standard_editor = None;
+            self.import_dialog = None;
+            self.export_confirm_dialog = None;
+            self.export_dialog = None;
+            self.details_dialog = Some(DetailsDialog::new(
+                "Export Blocked",
+                std::iter::once(
+                    "The EDID was not written because these errors must be fixed:".to_string(),
+                )
+                .chain(std::iter::once(String::new()))
+                .chain(blocking)
+                .collect(),
+            ));
+            self.status = "Export blocked by EDID validation errors.".to_string();
+            return;
+        }
+
         if !issues.is_empty() {
             self.detailed_editor = None;
             self.standard_editor = None;
@@ -975,7 +1002,7 @@ impl App {
     fn export_validation_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
         let Some(monitor) = self.selected_monitor() else {
-            issues.push("No monitor is selected.".to_string());
+            issues.push("Error: No monitor is selected.".to_string());
             return issues;
         };
 
@@ -990,17 +1017,17 @@ impl App {
             }
         } else {
             let Some(edid) = monitor.edid.as_ref() else {
-                issues.push("Selected monitor has no readable EDID to patch.".to_string());
+                issues.push("Error: Selected monitor has no readable EDID to patch.".to_string());
                 return issues;
             };
 
             if !edid.checksum_valid {
-                issues.push("Base EDID checksum is invalid.".to_string());
+                issues.push("Error: Base EDID checksum is invalid.".to_string());
             }
             for cta in &edid.cta_blocks {
                 if !cta.checksum_valid {
                     issues.push(format!(
-                        "CTA-861 extension {} checksum is invalid.",
+                        "Error: CTA-861 extension {} checksum is invalid.",
                         cta.extension_index
                     ));
                 }
@@ -1012,12 +1039,12 @@ impl App {
                 .unwrap_or(0);
             if free_dtd_slots == 0 {
                 issues.push(
-                    "No free base or CTA detailed timing slot is visible for draft insertion."
+                    "Error: No free base or CTA detailed timing slot is visible for draft insertion."
                         .to_string(),
                 );
             }
             issues.push(
-                "No workspace EDID changes are pending; export will insert the current draft detailed timing."
+                "Warning: No workspace EDID changes are pending; export will insert the current draft detailed timing."
                     .to_string(),
             );
         }
@@ -1027,18 +1054,18 @@ impl App {
                 validate_timing(&self.draft_timing)
                     .into_iter()
                     .map(|warning| {
-                        format!("Draft timing {}: {}", warning.label(), warning.message)
+                        format!("{}: Draft timing: {}", warning.label(), warning.message)
                     }),
             );
             if let Some(warning) = self.internal_panel_timing_warning() {
-                issues.push(format!("Panel warning: {}", warning.message));
+                issues.push(format!("Warning: Internal panel: {}", warning.message));
             }
 
             if let Some(key) = ModeKey::from_timing(&self.draft_timing) {
                 let provenance = self.mode_provenance(key);
                 if provenance.sources.len() > 1 {
                     issues.push(format!(
-                        "Draft timing duplicates an existing mode in {} source(s): {}.",
+                        "Warning: Draft timing duplicates an existing mode in {} source(s): {}.",
                         provenance.sources.len(),
                         provenance.sources.join(", ")
                     ));
@@ -1150,11 +1177,10 @@ impl App {
     }
 
     fn selected_or_first_free_cta_slot(&self) -> Option<(u8, usize)> {
-        if let Some(row) = self.selected_extension_slot()
-            && row.timing.is_none()
-            && !row.occupied_unknown
-        {
-            return Some((row.extension_index, row.slot));
+        if let Some(row) = self.selected_extension_slot() {
+            if row.timing.is_none() && !row.occupied_unknown {
+                return Some((row.extension_index, row.slot));
+            }
         }
 
         self.working_extension_rows()
@@ -1410,17 +1436,17 @@ impl App {
             }
         }
 
-        if let Some(status) = override_status
-            && !status.read_warnings.is_empty()
-        {
-            lines.push(String::new());
-            lines.push("Read warnings".to_string());
-            lines.extend(
-                status
-                    .read_warnings
-                    .into_iter()
-                    .map(|warning| format!("- {warning}")),
-            );
+        if let Some(status) = override_status {
+            if !status.read_warnings.is_empty() {
+                lines.push(String::new());
+                lines.push("Read warnings".to_string());
+                lines.extend(
+                    status
+                        .read_warnings
+                        .into_iter()
+                        .map(|warning| format!("- {warning}")),
+                );
+            }
         }
 
         self.detailed_editor = None;
@@ -1860,10 +1886,11 @@ fn help_lines() -> Vec<String> {
         "Global keys",
         "Tab / Shift+Tab  Move between panes",
         "Up/Down or j/k    Move the focused selection",
-        "Enter             Activate the focused default action",
+        "Enter             Open details, edit a selected row, or add when no row is selected",
         "? / h / F1        Open this help",
         "i                 Details for the focused monitor or row",
         "e                 Export patched EDID",
+        "Shift+E           Edit the selected detailed, standard, or CTA DTD row",
         "A                 Install/Update EDID override",
         "u                 Uninstall drmcru EDID override",
         "s                 Switch to selected exposed mode",
@@ -1872,7 +1899,7 @@ fn help_lines() -> Vec<String> {
         "",
         "Detailed and CTA timing keys",
         "a                 Add timing in the focused timing pane",
-        "e or section Edit Edit selected row with the section button",
+        "Shift+E / Edit    Edit the selected row",
         "c                 Copy selected detailed or CTA DTD timing",
         "p                 Paste copied detailed timing into a new slot",
         "d / Delete        Delete selected timing",
@@ -2018,17 +2045,20 @@ fn append_connector_config_lines(lines: &mut Vec<String>, connector: &str) {
     let report = hyprland_config::inspect_connector_rules(connector);
     lines.push(String::new());
     lines.push("Hyprland connector config".to_string());
-    lines.push(format!("Root: {}", report.root_path.display()));
+    lines.push(format!(
+        "Root: {}",
+        hyprland_config::human_path(&report.root_path)
+    ));
     lines.push(format!("Files read: {}", report.files_read));
     lines.push(format!(
         "Literal rules for connector: {}",
         report.connector_rules.len()
     ));
     if let Some(rule) = &report.last_connector_rule {
-        lines.push(format!("Winning rule: {}", rule.location()));
-        lines.push(format!("Winning mode: {}", rule.normalized_rule()));
+        lines.push(format!("Last literal rule: {}", rule.location()));
+        lines.push(format!("Last literal mode: {}", rule.normalized_rule()));
     } else {
-        lines.push("Winning rule: none".to_string());
+        lines.push("Last literal rule: none".to_string());
     }
 
     if !report.read_warnings.is_empty() {
@@ -2052,7 +2082,10 @@ fn append_connector_config_lines(lines: &mut Vec<String>, connector: &str) {
 fn append_config_inspection_lines(lines: &mut Vec<String>, report: &MonitorRuleInspection) {
     lines.push(String::new());
     lines.push("Hyprland config check".to_string());
-    lines.push(format!("Root: {}", report.root_path.display()));
+    lines.push(format!(
+        "Root: {}",
+        hyprland_config::human_path(&report.root_path)
+    ));
     lines.push(format!("Files read: {}", report.files_read));
     lines.push(format!(
         "Literal rules for connector: {}",
@@ -2072,16 +2105,24 @@ fn append_config_inspection_lines(lines: &mut Vec<String>, report: &MonitorRuleI
     }
 
     if report.exact_match_is_effective() {
-        lines.push("Config result: reload should keep the selected mode.".to_string());
+        lines.push(
+            "Config result: the selected mode is the last literal rule found; dynamic Lua may still override it."
+                .to_string(),
+        );
     } else if report.exact_match.is_some() {
-        lines
-            .push("Config result: a later connector rule may override the exact rule.".to_string());
+        lines.push(
+            "Config result: a later literal connector rule may override the exact rule."
+                .to_string(),
+        );
     } else if report.connector_rules.is_empty() {
         lines.push(
             "Config result: no literal monitor rule for this connector was found.".to_string(),
         );
     } else {
-        lines.push("Config result: reload likely uses a different monitor rule.".to_string());
+        lines.push(
+            "Config result: the last literal connector rule differs from the selected mode."
+                .to_string(),
+        );
     }
 
     if !report.read_warnings.is_empty() {
@@ -2100,6 +2141,36 @@ fn append_config_inspection_lines(lines: &mut Vec<String>, report: &MonitorRuleI
             ));
         }
     }
+}
+
+pub(super) fn normalize_import_path(value: &str, home: Option<&Path>) -> PathBuf {
+    let value = value.trim();
+    let value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+
+    if value == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    }
+    if let Some(rest) = value.strip_prefix("$HOME/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    }
+
+    PathBuf::from(value)
 }
 
 fn polarity_label(positive: bool) -> &'static str {
