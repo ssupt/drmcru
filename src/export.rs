@@ -302,7 +302,15 @@ mod tests {
             build_export_plan_for_monitor(&monitor, "drmcru_custom_DP-1.bin", sample_timing());
 
         let rule = plan.hyprland_monitor_rule();
-        assert!(rule.starts_with("monitor=DP-1,1920x1080@"));
-        assert!(rule.ends_with(",2560x0,1.25"));
+        if rule.starts_with("monitor=") {
+            assert!(rule.starts_with("monitor=DP-1,1920x1080@"));
+            assert!(rule.ends_with(",2560x0,1.25"));
+        } else {
+            assert!(rule.starts_with("hl.monitor({"));
+            assert!(rule.contains("output = \"DP-1\""));
+            assert!(rule.contains("mode = \"1920x1080@"));
+            assert!(rule.contains("position = \"2560x0\""));
+            assert!(rule.contains("scale = 1.25"));
+        }
     }
 }

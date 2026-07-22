@@ -26,6 +26,13 @@ Install/Update/Uninstall is currently limited to Limine systems that rebuild wit
 
 ## Install
 
+On Arch Linux, install [`drmcru-bin`](https://aur.archlinux.org/packages/drmcru-bin)
+from the AUR using an AUR helper of your choice, for example:
+
+```sh
+yay -S drmcru-bin
+```
+
 Download the portable x86-64 binary from the
 [latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.1):
 
