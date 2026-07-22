@@ -1,4 +1,5 @@
 mod cli;
+mod demo;
 mod discovery;
 mod doctor;
 mod edid;
@@ -20,6 +21,7 @@ fn main() -> Result<()> {
             let monitors = discovery::discover_monitors()?;
             tui::App::new(monitors).run()
         }
+        Ok(cli::Command::Demo) => tui::App::new(demo::monitors()?).run(),
         Ok(cli::Command::Doctor) => doctor::run(),
         Ok(cli::Command::Help) => {
             println!("{}", cli::help_text());

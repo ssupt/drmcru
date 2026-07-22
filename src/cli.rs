@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Tui,
+    Demo,
     Doctor,
     Help,
     Version,
@@ -24,6 +25,7 @@ where
         [] => Ok(Command::Tui),
         [arg] if matches!(arg.as_str(), "-h" | "--help" | "help") => Ok(Command::Help),
         [arg] if matches!(arg.as_str(), "-V" | "--version" | "version") => Ok(Command::Version),
+        [arg] if matches!(arg.as_str(), "demo" | "--demo") => Ok(Command::Demo),
         [arg] if matches!(arg.as_str(), "doctor" | "--doctor") => Ok(Command::Doctor),
         [arg] => Err(format!("unknown argument: {arg}")),
         _ => Err(format!("too many arguments: {}", args.join(" "))),
@@ -37,6 +39,7 @@ pub fn help_text() -> String {
         String::new(),
         "Usage:".to_string(),
         "  drmcru             Start the TUI".to_string(),
+        "  drmcru demo        Preview the TUI with synthetic display data".to_string(),
         "  drmcru doctor      Print noninteractive diagnostics".to_string(),
         "  drmcru --version   Print version".to_string(),
         "  drmcru --help      Show this help".to_string(),
@@ -57,6 +60,8 @@ mod tests {
     fn parses_supported_commands() {
         assert_eq!(parse_args(["doctor"]), Ok(Command::Doctor));
         assert_eq!(parse_args(["--doctor"]), Ok(Command::Doctor));
+        assert_eq!(parse_args(["demo"]), Ok(Command::Demo));
+        assert_eq!(parse_args(["--demo"]), Ok(Command::Demo));
         assert_eq!(parse_args(["--help"]), Ok(Command::Help));
         assert_eq!(parse_args(["-h"]), Ok(Command::Help));
         assert_eq!(parse_args(["--version"]), Ok(Command::Version));

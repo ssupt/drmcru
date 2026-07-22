@@ -34,13 +34,13 @@ yay -S drmcru-bin
 ```
 
 Download the portable x86-64 binary from the
-[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.1):
+[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.2):
 
 ```sh
-curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.1/drmcru-0.1.1-x86_64-unknown-linux-musl
-chmod +x drmcru-0.1.1-x86_64-unknown-linux-musl
-./drmcru-0.1.1-x86_64-unknown-linux-musl doctor
-./drmcru-0.1.1-x86_64-unknown-linux-musl
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.2/drmcru-0.1.2-x86_64-unknown-linux-musl
+chmod +x drmcru-0.1.2-x86_64-unknown-linux-musl
+./drmcru-0.1.2-x86_64-unknown-linux-musl doctor
+./drmcru-0.1.2-x86_64-unknown-linux-musl
 ```
 
 The TUI and manual Export work on Linux systems that expose connectors through
@@ -66,10 +66,14 @@ Useful commands:
 
 ```sh
 cargo run
+cargo run -- demo
 cargo run -- doctor
 cargo run -- --help
 cargo run -- --version
 ```
+
+Run `drmcru demo` to explore the interface using synthetic display data without
+reading or changing a real monitor.
 
 ## Basic Workflow
 
