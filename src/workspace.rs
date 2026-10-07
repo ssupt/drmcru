@@ -3,7 +3,7 @@ use crate::edid::{
     block_checksum_valid, clear_detailed_timing_stereo, cta_dtd_slots, delete_detailed_timing,
     delete_standard_timing, detailed_timing_locations, insert_cta_detailed_timing,
     insert_detailed_timing, insert_standard_timing, parse_edid, patch_detailed_timing,
-    patch_standard_timing, slot_summary, standard_timing_locations,
+    patch_standard_timing, slot_summary, standard_timing_locations, swap_detailed_timings,
 };
 use crate::models::{EdidData, StandardTiming, TimingDescriptor};
 use std::path::Path;
@@ -232,8 +232,7 @@ impl EdidWorkspace {
 
         let current = &dtds[index];
         let target = &dtds[target_index];
-        let raw = patch_detailed_timing(&self.working.raw, current.location, &target.timing)?;
-        let raw = patch_detailed_timing(&raw, target.location, &current.timing)?;
+        let raw = swap_detailed_timings(&self.working.raw, current.location, target.location)?;
         let from = current.location;
         let to = target.location;
 
@@ -442,6 +441,22 @@ mod tests {
             v_sync_positive: false,
             interlaced: false,
         }
+    }
+
+    #[test]
+    fn reordering_moves_complete_descriptors_including_sync_and_size() {
+        let mut raw = minimal_base_edid(0);
+        raw = patch_base_detailed_timing(&raw, 0, &sample_timing()).unwrap();
+        raw = patch_base_detailed_timing(&raw, 1, &alternate_timing()).unwrap();
+        raw[54 + 12..54 + 18].copy_from_slice(&[1, 2, 3, 4, 5, 0x10]);
+        raw[72 + 12..72 + 18].copy_from_slice(&[6, 7, 8, 9, 10, 0x1e]);
+        let first = raw[54..72].to_vec();
+        let second = raw[72..90].to_vec();
+        let mut workspace = EdidWorkspace::new(raw).unwrap();
+        workspace.move_dtd(0, MoveDirection::Down).unwrap();
+        assert_eq!(&workspace.export_bytes()[54..72], second);
+        assert_eq!(&workspace.export_bytes()[72..90], first);
+        assert!(workspace.validate().is_empty());
     }
 
     fn alternate_timing() -> TimingDescriptor {

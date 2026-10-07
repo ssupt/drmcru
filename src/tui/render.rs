@@ -249,8 +249,15 @@ impl App {
         ])
         .areas(area);
         let inner = inner_rect(list_area);
-        self.sync_section_scroll(section, inner.height);
-        let title = self.section_title(section, inner.height);
+        let viewport_height = if section == ResolutionSection::Extension {
+            inner
+                .height
+                .saturating_sub(self.extension_header_count(inner.height) as u16)
+        } else {
+            inner.height
+        };
+        self.sync_section_scroll(section, viewport_height);
+        let title = self.section_title(section, viewport_height);
         let focused = matches!(
             (self.focus, section),
             (FocusArea::Detailed, ResolutionSection::Detailed)
@@ -359,8 +366,9 @@ impl App {
 
     fn draw_extension_rows(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let mut y = area.y;
+        let header_count = self.extension_header_count(area.height);
         if let Some(edid) = self.selected_edid() {
-            for cta in edid.cta_blocks.clone().iter() {
+            for cta in edid.cta_blocks.clone().iter().take(header_count) {
                 if y >= area.y.saturating_add(area.height) {
                     return;
                 }
@@ -385,7 +393,12 @@ impl App {
                 );
                 y = y.saturating_add(1);
             }
-            for displayid in edid.displayid_blocks.clone().iter() {
+            for displayid in edid
+                .displayid_blocks
+                .clone()
+                .iter()
+                .take(header_count.saturating_sub(edid.cta_blocks.len()))
+            {
                 if y >= area.y.saturating_add(area.height) {
                     return;
                 }
@@ -542,6 +555,13 @@ impl App {
                 }
             }
         }
+    }
+
+    fn extension_header_count(&self, viewport_height: u16) -> usize {
+        self.selected_edid()
+            .map(|edid| edid.cta_blocks.len() + edid.displayid_blocks.len())
+            .unwrap_or(0)
+            .min(usize::from(viewport_height.saturating_sub(1)))
     }
 
     fn section_title(&self, section: ResolutionSection, viewport_height: u16) -> String {
@@ -784,17 +804,15 @@ impl App {
             height: area.height.saturating_sub(2),
         };
         let [intro, fields, derived, actions] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(20),
-            Constraint::Min(9),
+            Constraint::Length(1),
+            Constraint::Length(inner.height.saturating_sub(8).min(19)),
+            Constraint::Min(4),
             Constraint::Length(3),
         ])
         .areas(inner);
 
         frame.render_widget(
-            Paragraph::new(
-                "Detailed Timing. Presets regenerate editable fields from active size and refresh.",
-            ),
+            Paragraph::new("Tab scrolls fields. Presets regenerate timings from size and refresh."),
             intro,
         );
 
@@ -806,7 +824,7 @@ impl App {
         }
 
         frame.render_widget(
-            Paragraph::new(editor.derived_text()).wrap(Wrap { trim: false }),
+            Paragraph::new(editor.summary_text(derived.height)).wrap(Wrap { trim: false }),
             derived,
         );
 
@@ -1267,6 +1285,7 @@ impl App {
         self.hitboxes
             .iter()
             .rev()
+            .filter(|hitbox| !self.modal_open() || hitbox.z > 0)
             .filter(|hitbox| super::support::rect_contains(hitbox.rect, x, y))
             .max_by_key(|hitbox| hitbox.z)
             .copied()

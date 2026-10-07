@@ -375,12 +375,51 @@ impl DetailedResolutionEditor {
     }
 
     pub(super) fn field_rows(&self, area: Rect) -> Vec<(EditorField, Rect, &'static str)> {
-        let rows = Layout::vertical([Constraint::Length(1); 19]).split(area);
-        detailed_field_order()
+        let order = detailed_field_order();
+        let visible = usize::from(area.height).min(order.len());
+        let active = order
+            .iter()
+            .position(|(field, _)| *field == self.active_field)
+            .unwrap_or(0);
+        let start = active
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(order.len() - visible);
+        order
             .into_iter()
-            .zip(rows.iter().copied())
-            .map(|((field, label), rect)| (field, rect, label))
+            .skip(start)
+            .take(visible)
+            .enumerate()
+            .map(|(index, (field, label))| {
+                (
+                    field,
+                    Rect::new(area.x, area.y + index as u16, area.width, 1),
+                    label,
+                )
+            })
             .collect()
+    }
+
+    pub(super) fn summary_text(&self, height: u16) -> String {
+        if height >= 9 {
+            return self.derived_text();
+        }
+        match self.timing() {
+            Ok(timing) => {
+                let mut lines = vec![
+                    format!("Mode: {}", timing.hyprland_mode()),
+                    format!("Pixel clock: {} kHz", timing.pixel_clock_khz),
+                ];
+                lines.extend(
+                    validate_timing(&timing)
+                        .into_iter()
+                        .take(usize::from(height.saturating_sub(2)))
+                        .map(|warning| format!("{}: {}", warning.label(), warning.message)),
+                );
+                lines.join("\n")
+            }
+            Err(reason) => format!("Invalid detailed timing: {reason}."),
+        }
     }
 
     pub(super) fn input(&self, field: EditorField) -> &TextInput {
@@ -529,7 +568,8 @@ impl DetailedResolutionEditor {
         if value == ' ' {
             let _ = self.toggle_field(field);
         } else if field.allows(value, self.input(field)) {
-            self.active_input_mut().insert(value);
+            self.active_input_mut()
+                .insert(if value == ',' { '.' } else { value });
             self.after_text_edit(field);
         }
     }
@@ -694,7 +734,8 @@ impl DetailedResolutionEditor {
             return;
         }
 
-        let pixel_clock_khz = (f64::from(h_total * v_total) * refresh_hz / 1000.0).round() as u32;
+        let pixel_clock_khz =
+            (f64::from(h_total) * f64::from(v_total) * refresh_hz / 1000.0).round() as u32;
         self.pixel_clock.set(pixel_clock_khz.to_string());
         self.h_rate.set(format!(
             "{:.3}",
@@ -784,7 +825,7 @@ impl DetailedResolutionEditor {
         self.pixel_clock.set(pixel_clock_khz.to_string());
         self.refresh_hint.set(format!(
             "{:.3}",
-            f64::from(pixel_clock_khz) * 1000.0 / f64::from(h_total * v_total)
+            f64::from(pixel_clock_khz) * 1000.0 / (f64::from(h_total) * f64::from(v_total))
         ));
     }
 
@@ -808,7 +849,7 @@ impl DetailedResolutionEditor {
         if edited_field != EditorField::Refresh {
             self.refresh_hint.set(format!(
                 "{:.3}",
-                f64::from(pixel_clock_khz) * 1000.0 / f64::from(h_total * v_total)
+                f64::from(pixel_clock_khz) * 1000.0 / (f64::from(h_total) * f64::from(v_total))
             ));
         }
     }
@@ -1130,7 +1171,6 @@ impl TextInput {
     }
 
     pub(super) fn insert(&mut self, value: char) {
-        let value = if value == ',' { '.' } else { value };
         self.buffer.insert(self.cursor, value);
         self.cursor += value.len_utf8();
     }
@@ -1192,6 +1232,46 @@ fn next_char_boundary(value: &str, cursor: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_paths_preserve_commas_while_refresh_accepts_decimal_commas() {
+        let mut input = TextInput::new("/tmp/display".to_string());
+        input.insert(',');
+        assert_eq!(input.buffer, "/tmp/display,");
+        let timing = crate::timings::cvt_reduced_blanking(CvtRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        });
+        let mut editor = DetailedResolutionEditor::from_timing(timing, EditorMode::Add);
+        editor.active_field = EditorField::Refresh;
+        editor.input_mut(EditorField::Refresh).set("60".to_string());
+        editor.insert_char(',');
+        editor.insert_char('5');
+        assert_eq!(editor.input(EditorField::Refresh).buffer, "60.5");
+    }
+
+    #[test]
+    fn large_editor_totals_do_not_overflow_clock_calculations() {
+        let timing = crate::timings::cvt_reduced_blanking(CvtRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        });
+        let mut editor = DetailedResolutionEditor::from_timing(timing, EditorMode::Add);
+        for field in [
+            EditorField::Width,
+            EditorField::Height,
+            EditorField::HBack,
+            EditorField::VBack,
+        ] {
+            editor.input_mut(field).set(u16::MAX.to_string());
+        }
+        editor.after_text_edit(EditorField::Width);
+        editor.set_pixel_clock_from_h_rate();
+        editor.update_rate_fields_from_pixel_clock(EditorField::PixelClock);
+        assert!(editor.manual_timing().is_err());
+    }
 
     #[test]
     fn text_input_moves_and_deletes_on_unicode_boundaries() {

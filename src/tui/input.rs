@@ -118,6 +118,18 @@ impl App {
                     }
                 }
             }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.modal_open() => {
+                let delta = if mouse.kind == MouseEventKind::ScrollDown {
+                    3
+                } else {
+                    -3
+                };
+                if let Some(dialog) = self.apply_confirm_dialog.as_mut() {
+                    dialog.scroll_by(delta);
+                } else if let Some(dialog) = self.apply_result_dialog.as_mut() {
+                    dialog.scroll_by(delta);
+                }
+            }
             MouseEventKind::ScrollDown => self.move_selection(1),
             MouseEventKind::ScrollUp => self.move_selection(-1),
             _ => {}

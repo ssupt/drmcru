@@ -471,6 +471,22 @@ pub fn delete_detailed_timing(raw: &[u8], location: DtdLocation) -> Result<Vec<u
     Ok(patched)
 }
 
+pub fn swap_detailed_timings(
+    raw: &[u8],
+    first: DtdLocation,
+    second: DtdLocation,
+) -> Result<Vec<u8>, EdidError> {
+    let (first_offset, first_block) = dtd_offset(raw, first)?;
+    let (second_offset, second_block) = dtd_offset(raw, second)?;
+    let mut patched = raw.to_vec();
+    for index in 0..DTD_LEN {
+        patched.swap(first_offset + index, second_offset + index);
+    }
+    repair_block_checksum(&mut patched[first_block..first_block + EDID_BLOCK_LEN]);
+    repair_block_checksum(&mut patched[second_block..second_block + EDID_BLOCK_LEN]);
+    Ok(patched)
+}
+
 #[cfg(test)]
 pub fn patch_base_detailed_timing(
     raw: &[u8],
@@ -672,6 +688,11 @@ pub fn encode_standard_timing(
         StandardTimingAspect::SixteenNine => 0b11,
     };
     let refresh_bits = (timing.refresh_hz - 60) as u8;
+    if width_byte == 0x01 && aspect_bits == 0 && refresh_bits == 0x01 {
+        return Err(EdidError::InvalidStandardTiming(
+            "256x160 at 61 Hz encodes the unused-slot marker",
+        ));
+    }
     Ok([width_byte, aspect_bits << 6 | refresh_bits])
 }
 
@@ -815,7 +836,10 @@ fn parse_displayid_block(extension_index: u8, block: &[u8]) -> Option<DisplayIdB
     let mut data_block_index = 0;
     while offset + DISPLAYID_DATA_BLOCK_HEADER_LEN <= payload_end {
         let tag = block[offset];
-        if tag == 0 {
+        if block[offset..offset + DISPLAYID_DATA_BLOCK_HEADER_LEN]
+            .iter()
+            .all(|byte| *byte == 0)
+        {
             break;
         }
         let revision = block[offset + 1];
@@ -1019,8 +1043,12 @@ fn parse_cta_video_modes(payload: &[u8]) -> Vec<CtaVideoDescriptor> {
     payload
         .iter()
         .map(|descriptor| {
-            let native = descriptor & 0x80 != 0;
-            let vic = u16::from(descriptor & 0x7f);
+            let native = (129..=192).contains(descriptor);
+            let vic = u16::from(if native {
+                descriptor & 0x7f
+            } else {
+                *descriptor
+            });
             cta_vic_mode(vic, native)
                 .map(CtaVideoDescriptor::Known)
                 .unwrap_or(CtaVideoDescriptor::Unknown { vic, native })
@@ -1472,6 +1500,44 @@ mod tests {
     }
 
     #[test]
+    fn displayid_product_id_does_not_hide_following_timings() {
+        let mut edid = minimal_base_edid(1);
+        let mut block = [0u8; 128];
+        block[0] = DISPLAYID_TAG;
+        block[1] = 0x13;
+        block[2] = 30;
+        block[5..12].copy_from_slice(&[0, 0, 4, 1, 2, 3, 4]);
+        block[12..15].copy_from_slice(&[3, 1, 20]);
+        block[15..35].copy_from_slice(&[
+            0x19, 0x13, 0x01, 0x84, 0xff, 0x09, 0xaf, 0x00, 0x2f, 0x00, 0x1f, 0x00, 0x9f, 0x05,
+            0x77, 0x00, 0x02, 0x00, 0x05, 0x00,
+        ]);
+        repair_block_checksum(&mut block);
+        edid.extend_from_slice(&block);
+        let parsed = parse_edid(edid).unwrap();
+        let displayid = &parsed.displayid_blocks[0];
+        assert_eq!(displayid.data_blocks.len(), 2);
+        assert_eq!(displayid.data_blocks[0].label(), "Product ID");
+        assert_eq!(displayid.detailed_timings.len(), 1);
+    }
+
+    #[test]
+    fn cta_extended_video_codes_do_not_alias_legacy_native_modes() {
+        assert_eq!(
+            parse_cta_video_modes(&[193]),
+            vec![CtaVideoDescriptor::Unknown {
+                vic: 193,
+                native: false
+            }]
+        );
+        let CtaVideoDescriptor::Known(mode) = &parse_cta_video_modes(&[144])[0] else {
+            panic!("native VIC 16 should be mapped");
+        };
+        assert_eq!(mode.vic, 16);
+        assert!(mode.native);
+    }
+
+    #[test]
     fn parses_and_deletes_standard_timing() {
         let mut edid = minimal_base_edid(0);
         edid[STANDARD_TIMING_START] = (1920u16 / 8 - 31) as u8;
@@ -1545,6 +1611,18 @@ mod tests {
             encode_standard_timing(&timing),
             Err(EdidError::InvalidStandardTiming(_))
         ));
+    }
+
+    #[test]
+    fn standard_timing_cannot_encode_the_unused_slot_marker() {
+        let timing = StandardTiming {
+            slot: 0,
+            width: 256,
+            height: 160,
+            refresh_hz: 61,
+            aspect: StandardTimingAspect::SixteenTen,
+        };
+        assert!(encode_standard_timing(&timing).is_err());
     }
 
     #[test]

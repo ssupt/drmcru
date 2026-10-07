@@ -175,7 +175,9 @@ fn lua_string(value: &str) -> String {
 
 #[derive(Default)]
 struct ConfigParser {
+    // Only active includes are guarded; source/dofile can load a file again.
     seen: BTreeSet<PathBuf>,
+    required: BTreeSet<PathBuf>,
     files_read: usize,
     monitor_rules: Vec<MonitorRule>,
     read_warnings: Vec<String>,
@@ -185,7 +187,7 @@ impl ConfigParser {
     fn read_file(&mut self, path: &Path) {
         let display_path = path.to_path_buf();
         let seen_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if !self.seen.insert(seen_path) {
+        if !self.seen.insert(seen_path.clone()) {
             return;
         }
 
@@ -194,6 +196,7 @@ impl ConfigParser {
             Err(error) => {
                 self.read_warnings
                     .push(format!("Could not read {}: {error}", human_path(path)));
+                self.seen.remove(&seen_path);
                 return;
             }
         };
@@ -228,11 +231,16 @@ impl ConfigParser {
                             continue;
                         };
                         if let Some(source) = resolve_lua_require(&module, &display_path) {
-                            self.read_file(&source);
+                            let module_path =
+                                fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
+                            if self.required.insert(module_path) {
+                                self.read_file(&source);
+                            }
                         }
                     }
                 }
             }
+            self.seen.remove(&seen_path);
             return;
         }
 
@@ -265,6 +273,7 @@ impl ConfigParser {
                 _ => {}
             }
         }
+        self.seen.remove(&seen_path);
     }
 }
 
@@ -549,10 +558,15 @@ fn strip_lua_comments(contents: &str) -> String {
 }
 
 fn parse_literal_lua_call_argument(raw: &str) -> Option<String> {
+    let cleaned = strip_lua_comments(raw);
+    let raw = cleaned.as_str();
     let open = raw.find('(')?;
     let value = raw.get(open + 1..raw.len().checked_sub(1)?)?.trim();
     let quote = *value.as_bytes().first()?;
-    if !matches!(quote, b'\'' | b'"') || value.as_bytes().last() != Some(&quote) {
+    if !matches!(quote, b'\'' | b'"')
+        || value.as_bytes().last() != Some(&quote)
+        || skip_quoted_lua_string(value.as_bytes(), 0) != value.len()
+    {
         return None;
     }
 
@@ -843,6 +857,55 @@ mod tests {
             "drmcru-hypr-config-test-{}-{now}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn repeated_source_and_dofile_preserve_load_order_but_require_is_cached() {
+        for extension in ["conf", "lua"] {
+            let dir = unique_test_dir();
+            fs::create_dir_all(&dir).unwrap();
+            let root = dir.join(format!("hyprland.{extension}"));
+            let source = dir.join(format!("monitors.{extension}"));
+            let rule = "monitor=DP-1,1920x1080@60,auto,1";
+            if extension == "conf" {
+                fs::write(&source, format!("{rule}\nsource=hyprland.conf\n")).unwrap();
+                fs::write(&root, "source=monitors.conf\nmonitor=DP-1,1920x1080@144,auto,1\nsource=monitors.conf\n").unwrap();
+            } else {
+                fs::write(&source, "hl.monitor({output='DP-1', mode='1920x1080@60', position='auto', scale=1})\ndofile('hyprland.lua')\n").unwrap();
+                fs::write(&root, "dofile('monitors.lua')\nhl.monitor({output='DP-1', mode='1920x1080@144', position='auto', scale=1})\ndofile('monitors.lua')\n").unwrap();
+            }
+            let report = inspect_monitor_rule_from(root.clone(), "DP-1", rule);
+            assert_eq!(report.connector_rules.len(), 3);
+            assert!(report.exact_match_is_effective());
+            if extension == "lua" {
+                fs::write(
+                    &source,
+                    "hl.monitor({output='DP-1', mode='1920x1080@60', position='auto', scale=1})\n",
+                )
+                .unwrap();
+                fs::write(&root, "require('monitors')\nhl.monitor({output='DP-1', mode='1920x1080@144', position='auto', scale=1})\nrequire('monitors')\n").unwrap();
+                let report = inspect_monitor_rule_from(root, "DP-1", rule);
+                assert_eq!(report.connector_rules.len(), 2);
+                assert!(!report.exact_match_is_effective());
+            }
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn literal_lua_arguments_reject_concatenation_and_accept_comments() {
+        assert_eq!(
+            parse_literal_lua_call_argument("dofile('monitors.lua' -- comment\n)"),
+            Some("monitors.lua".to_string())
+        );
+        assert_eq!(
+            parse_literal_lua_call_argument("dofile('monitors' .. '.lua')"),
+            None
+        );
+        assert_eq!(
+            parse_literal_lua_call_argument("require('hypr.' .. module .. '.lua')"),
+            None
+        );
     }
 
     #[test]

@@ -96,12 +96,16 @@ pub fn validate_timing(timing: &TimingDescriptor) -> Vec<TimingWarning> {
             timing.v_blanking
         )));
     }
-    if timing.h_front_porch + timing.h_sync_width > timing.h_blanking {
+    if u32::from(timing.h_front_porch) + u32::from(timing.h_sync_width)
+        > u32::from(timing.h_blanking)
+    {
         warnings.push(TimingWarning::error(
             "horizontal front porch plus sync width exceeds horizontal blanking",
         ));
     }
-    if timing.v_front_porch + timing.v_sync_width > timing.v_blanking {
+    if u32::from(timing.v_front_porch) + u32::from(timing.v_sync_width)
+        > u32::from(timing.v_blanking)
+    {
         warnings.push(TimingWarning::error(
             "vertical front porch plus sync width exceeds vertical blanking",
         ));
@@ -220,6 +224,20 @@ mod tests {
     #[test]
     fn valid_timing_has_no_warnings() {
         assert!(validate_timing(&valid_timing()).is_empty());
+    }
+
+    #[test]
+    fn oversized_porches_report_errors_without_overflowing() {
+        let mut timing = valid_timing();
+        timing.h_front_porch = u16::MAX;
+        timing.h_sync_width = u16::MAX;
+        timing.v_front_porch = u16::MAX;
+        timing.v_sync_width = u16::MAX;
+        assert!(
+            validate_timing(&timing)
+                .iter()
+                .any(|warning| warning.severity == TimingWarningSeverity::Error)
+        );
     }
 
     #[test]

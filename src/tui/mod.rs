@@ -281,6 +281,19 @@ impl App {
         self.monitors.get(self.selected_monitor)
     }
 
+    fn modal_open(&self) -> bool {
+        self.vrr_editor.is_some()
+            || self.detailed_editor.is_some()
+            || self.standard_editor.is_some()
+            || self.import_dialog.is_some()
+            || self.details_dialog.is_some()
+            || self.export_confirm_dialog.is_some()
+            || self.export_dialog.is_some()
+            || self.apply_confirm_dialog.is_some()
+            || self.apply_result_dialog.is_some()
+            || self.applying_in_progress
+    }
+
     fn selected_override_status(&self) -> Option<&InstalledOverrideStatus> {
         self.override_statuses.get(self.selected_monitor)
     }
@@ -725,6 +738,149 @@ mod tests {
     }
 
     #[test]
+    fn modal_mouse_events_cannot_change_background_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new(vec![monitor_with_cta_dtd(), monitor_with_cta_dtd()]);
+        app.open_detailed_editor(state::EditorMode::Add);
+        app.push_hitbox(Rect::new(0, 0, 20, 3), HitTarget::MonitorSelector, 0);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected_monitor, 0);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected_detailed, None);
+    }
+
+    #[test]
+    fn compact_terminal_keeps_active_editor_and_extension_rows_visible() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        app.open_detailed_editor(state::EditorMode::Add);
+        for _ in 0..19 {
+            let active = app.detailed_editor.as_ref().unwrap().active_field;
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            assert!(
+                app.hitboxes
+                    .iter()
+                    .any(|hitbox| hitbox.target == HitTarget::ModalField(active)
+                        && hitbox.rect.height > 0)
+            );
+            app.detailed_editor.as_mut().unwrap().next_field();
+        }
+        assert!(app.hitboxes.iter().any(|hitbox| hitbox.target
+            == HitTarget::ModalButton(state::ModalButton::Ok)
+            && hitbox.rect.height > 0));
+
+        app.detailed_editor = None;
+        app.selected_extension = Some(3);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(app.hitboxes.iter().any(|hitbox| hitbox.target == HitTarget::ExtensionRow(3) && hitbox.rect.height > 0));
+    }
+
+    #[test]
+    fn deleting_last_detailed_and_standard_rows_clears_selection() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        app.selected_detailed = Some(0);
+        app.delete_selected_detailed();
+        assert!(app.working_dtds().is_empty());
+        assert_eq!(app.selected_detailed, None);
+
+        let standard = crate::models::StandardTiming {
+            slot: 0,
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            aspect: crate::models::StandardTimingAspect::SixteenNine,
+        };
+        app.selected_workspace_mut()
+            .unwrap()
+            .add_standard_timing(standard)
+            .unwrap();
+        app.selected_standard = Some(0);
+        app.delete_selected_standard();
+        assert!(app.working_standard_timings().is_empty());
+        assert_eq!(app.selected_standard, None);
+    }
+
+    #[test]
+    fn cta_delete_keeps_selection_after_video_rows() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        let location = DtdLocation::Cta {
+            extension_index: 1,
+            slot: 5,
+        };
+        app.selected_workspace_mut()
+            .unwrap()
+            .add_cta_dtd_at(location, timing())
+            .unwrap();
+        app.selected_extension = Some(6);
+        app.delete_selected_extension_dtd();
+        assert_eq!(app.selected_extension, Some(6));
+        assert!(
+            matches!(&app.working_extension_rows()[6], ExtensionRow::Dtd(row) if row.slot == 5 && row.timing.is_none())
+        );
+    }
+
+    #[test]
+    fn draft_export_checks_unknown_extension_checksums_and_length() {
+        for truncate in [false, true] {
+            let mut monitor = monitor_with_cta_dtd();
+            let mut raw = monitor.edid.take().unwrap().raw;
+            raw[128] = 0x40;
+            repair_checksum(&mut raw[128..]);
+            if truncate {
+                raw.pop();
+            } else {
+                raw[129] ^= 1;
+            }
+            monitor.edid = Some(parse_edid(raw).unwrap());
+            let mut app = App::new(vec![monitor]);
+            app.export_selected_monitor();
+            assert!(
+                app.details_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.title == "Export Blocked")
+            );
+            assert!(app.export_confirm_dialog.is_none());
+        }
+    }
+
+    #[test]
+    fn draft_export_can_append_a_cta_when_existing_slots_are_full() {
+        let mut monitor = monitor_with_cta_dtd();
+        let mut raw = monitor.edid.take().unwrap().raw;
+        for slot in 0..4 {
+            raw = crate::edid::patch_detailed_timing(&raw, DtdLocation::Base { slot }, &timing())
+                .unwrap();
+        }
+        for slot in 0..6 {
+            raw = crate::edid::patch_detailed_timing(
+                &raw,
+                DtdLocation::Cta {
+                    extension_index: 1,
+                    slot,
+                },
+                &timing(),
+            )
+            .unwrap();
+        }
+        monitor.edid = Some(parse_edid(raw).unwrap());
+        let mut app = App::new(vec![monitor]);
+        app.export_selected_monitor();
+        assert!(app.export_confirm_dialog.is_some());
+        assert!(app.details_dialog.is_none());
+    }
+
+    #[test]
     fn apply_refuses_unchanged_workspace() {
         let mut app = App::new(vec![monitor_with_cta_dtd()]);
 
@@ -766,6 +922,7 @@ mod tests {
         assert!(app.selected_workspace().unwrap().has_changes());
         app.open_vrr_editor();
         assert_eq!(app.vrr_editor.as_ref().unwrap().inputs[0].buffer, "40");
+        assert!(app.modal_open());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
