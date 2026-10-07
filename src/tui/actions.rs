@@ -25,6 +25,19 @@ struct SwitchModeCandidate {
 
 impl App {
     pub(super) fn open_vrr_editor(&mut self) {
+        if self.detailed_editor.is_some()
+            || self.standard_editor.is_some()
+            || self.import_dialog.is_some()
+            || self.details_dialog.is_some()
+            || self.export_confirm_dialog.is_some()
+            || self.export_dialog.is_some()
+            || self.apply_confirm_dialog.is_some()
+            || self.apply_result_dialog.is_some()
+            || self.applying_in_progress
+        {
+            self.status = "Close the current dialog before editing the VRR range.".to_string();
+            return;
+        }
         let result = self
             .selected_edid()
             .ok_or_else(|| "Selected monitor has no editable EDID.".to_string())

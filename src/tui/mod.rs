@@ -748,6 +748,11 @@ mod tests {
         repair_checksum(&mut raw[..128]);
         monitor.edid = Some(parse_edid(raw).unwrap());
         let mut app = App::new(vec![monitor]);
+        app.open_help_dialog();
+        app.open_vrr_editor();
+        assert!(app.vrr_editor.is_none());
+        assert!(app.details_dialog.is_some());
+        app.details_dialog = None;
         app.handle_main_key(crossterm::event::KeyEvent::from(
             crossterm::event::KeyCode::Char('R'),
         ));
