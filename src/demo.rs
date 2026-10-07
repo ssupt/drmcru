@@ -52,7 +52,7 @@ fn sample_edid() -> Result<Vec<u8>> {
     base[21] = 60;
     base[22] = 34;
     base[23] = 120;
-    base[24] = 0x0a;
+    base[24] = 0x0b;
     base[35] = 1 << 5;
     base[36] = 1 << 3;
     base[38..54].fill(0x01);
@@ -78,17 +78,16 @@ fn sample_edid() -> Result<Vec<u8>> {
         base[offset..offset + 2].copy_from_slice(&encoded);
     }
 
-    for (slot, timing) in [
-        timing_1440p(144.0),
-        timing_1440p(120.0),
-        timing_1080p(120.0),
-    ]
-    .iter()
-    .enumerate()
+    for (slot, timing) in [timing_1440p(144.0), timing_1440p(120.0)]
+        .iter()
+        .enumerate()
     {
         let offset = 54 + slot * DTD_LEN;
         base[offset..offset + DTD_LEN].copy_from_slice(&encode_detailed_timing(timing)?);
     }
+    base[90..108].copy_from_slice(&[
+        0, 0, 0, 0xfd, 0, 48, 144, 30, 220, 60, 1, 10, 0, 0, 0, 0, 0, 0,
+    ]);
     write_name_descriptor(&mut base[108..126], "Example Display");
     base[126] = 1;
     repair_checksum(base);
@@ -100,6 +99,8 @@ fn sample_edid() -> Result<Vec<u8>> {
     cta[4] = (2 << 5) | 4;
     cta[5..9].copy_from_slice(&[0x80 | 16, 4, 64, 97]);
     cta[9..9 + DTD_LEN].copy_from_slice(&encode_detailed_timing(&timing_1080p(60.0))?);
+    cta[9 + DTD_LEN..9 + 2 * DTD_LEN]
+        .copy_from_slice(&encode_detailed_timing(&timing_1080p(120.0))?);
     repair_checksum(cta);
 
     Ok(raw)
@@ -188,6 +189,13 @@ mod tests {
         assert!(monitor.hyprland.as_ref().unwrap().serial.is_none());
         assert!(edid.checksum_valid);
         assert!(edid.cta_blocks[0].checksum_valid);
+        assert_eq!(
+            crate::edid::vrr_range(&edid.raw).unwrap(),
+            crate::edid::VrrRange {
+                min_hz: 48,
+                max_hz: 144
+            }
+        );
         assert_eq!(edid.monitor_name.as_deref(), Some("Example Displ"));
     }
 }

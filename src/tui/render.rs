@@ -60,6 +60,10 @@ impl App {
         );
         self.draw_global_buttons(frame, bottom_bar);
 
+        if let Some(editor) = self.vrr_editor.clone() {
+            self.draw_vrr_editor(frame, &editor);
+        }
+
         if let Some(editor) = self.detailed_editor.clone() {
             self.draw_detailed_editor(frame, &editor);
         }
@@ -685,6 +689,7 @@ impl App {
             "Install"
         };
         let buttons = [
+            ("VRR range", GlobalAction::VrrRange),
             ("Import", GlobalAction::Import),
             ("Export", GlobalAction::Export),
             ("Switch", GlobalAction::SwitchMode),
@@ -706,6 +711,59 @@ impl App {
                 .block(Block::default().borders(Borders::ALL)),
             area,
         );
+    }
+
+    fn draw_vrr_editor(&mut self, frame: &mut Frame<'_>, editor: &super::state::VrrRangeEditor) {
+        let area = centered_rect(frame.area(), 76, 14);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default()
+                .title("VRR range limits")
+                .borders(Borders::ALL),
+            area,
+        );
+        let [help, minimum, maximum, error, actions] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(3),
+        ])
+        .areas(area.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        }));
+        frame.render_widget(Paragraph::new("Edit the existing EDID range in whole Hz (1–510).\nTab selects a field; Enter saves; Esc cancels.\nExport or Install/Update and reboot to apply.").wrap(Wrap { trim: true }), help);
+        for (index, (rect, label)) in [(minimum, "Minimum Hz"), (maximum, "Maximum Hz")]
+            .into_iter()
+            .enumerate()
+        {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{label}: [{}]",
+                    editor.inputs[index].render(editor.active == index)
+                ))
+                .style(Style::default().fg(Color::Cyan)),
+                rect,
+            );
+            self.push_hitbox(rect, HitTarget::VrrField(index), 2);
+        }
+        frame.render_widget(
+            Paragraph::new(editor.error.as_str())
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: true }),
+            error,
+        );
+        let [ok, cancel, _] = Layout::horizontal([
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Min(0),
+        ])
+        .areas(actions);
+        self.draw_button(frame, ok, "Save");
+        self.draw_button(frame, cancel, "Cancel");
+        self.push_hitbox(ok, HitTarget::ModalButton(ModalButton::Ok), 2);
+        self.push_hitbox(cancel, HitTarget::ModalButton(ModalButton::Cancel), 2);
     }
 
     fn draw_detailed_editor(&mut self, frame: &mut Frame<'_>, editor: &DetailedResolutionEditor) {

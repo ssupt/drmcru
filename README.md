@@ -100,6 +100,21 @@ new EDID mode appear.
 - Base-block detailed timing descriptors
 - Base-block standard timings
 - CTA-861 extension detailed timing descriptors
+- EDID 1.4 range-limits-only VRR descriptors (minimum and maximum refresh)
+
+Choose **VRR range** or press `Shift+R` to edit an existing advertised range.
+For example, change `24–120 Hz` to `40–120 Hz` when the monitor cannot operate
+reliably below 40 Hz. Export or Install/Update the override and reboot to apply.
+The editor preserves horizontal limits and other descriptor data and supports
+whole Hz from 1 to 510. It requires a continuous-frequency EDID with an existing
+range-limits-only descriptor, as used by Linux DRM for DisplayPort VRR. HDMI
+FreeSync/Forum and DisplayID VRR blocks are currently read-only; the editor
+does not add VRR support to a monitor that does not advertise it.
+
+Export and Install/Update clear stereo flags from all base and CTA detailed
+resolutions and repair the affected checksums. This also works when clearing
+stereo flags is the only pending change. Sync polarity, interlace, physical
+dimensions, and unrelated descriptors and extension data are preserved.
 
 DisplayID Type I detailed timings are decoded and can be copied into an
 editable EDID DTD. DisplayID blocks themselves are currently read-only.

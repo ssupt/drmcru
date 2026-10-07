@@ -46,6 +46,7 @@ pub struct App {
     detailed_clipboard: Option<TimingDescriptor>,
     detailed_editor: Option<DetailedResolutionEditor>,
     standard_editor: Option<StandardResolutionEditor>,
+    vrr_editor: Option<state::VrrRangeEditor>,
     import_dialog: Option<ImportDialog>,
     details_dialog: Option<DetailsDialog>,
     export_confirm_dialog: Option<ExportConfirmDialog>,
@@ -92,6 +93,7 @@ enum SectionAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalAction {
+    VrrRange,
     Import,
     Export,
     SwitchMode,
@@ -153,6 +155,7 @@ enum HitTarget {
     GlobalButton(GlobalAction),
     ModalField(state::EditorField),
     ImportPathField,
+    VrrField(usize),
     ModalButton(state::ModalButton),
 }
 
@@ -212,6 +215,7 @@ impl App {
             detailed_clipboard: None,
             detailed_editor: None,
             standard_editor: None,
+            vrr_editor: None,
             import_dialog: None,
             details_dialog: None,
             export_confirm_dialog: None,
@@ -240,6 +244,8 @@ impl App {
                     Event::Key(key) => {
                         if self.applying_in_progress {
                             // Swallow all keys while install is running
+                        } else if self.vrr_editor.is_some() {
+                            self.handle_vrr_editor_key(key);
                         } else if self.detailed_editor.is_some() {
                             self.handle_detailed_editor_key(key);
                         } else if self.standard_editor.is_some() {
@@ -727,6 +733,50 @@ mod tests {
         assert!(app.pending_system_action.is_none());
         assert!(app.apply_confirm_dialog.is_none());
         assert!(app.status.contains("No workspace changes"));
+    }
+
+    #[test]
+    fn vrr_dialog_rejects_invalid_input_and_saves_a_valid_range() {
+        let mut monitor = monitor_with_cta_dtd();
+        let mut raw = monitor.edid.as_ref().unwrap().raw.clone();
+        raw[18] = 1;
+        raw[19] = 4;
+        raw[24] |= 1;
+        raw[108..126].copy_from_slice(&[
+            0, 0, 0, 0xfd, 0, 24, 120, 30, 200, 60, 1, 10, 0, 0, 0, 0, 0, 0,
+        ]);
+        repair_checksum(&mut raw[..128]);
+        monitor.edid = Some(parse_edid(raw).unwrap());
+        let mut app = App::new(vec![monitor]);
+        app.handle_main_key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char('R'),
+        ));
+        app.vrr_editor.as_mut().unwrap().inputs[0].set("121".to_string());
+        app.apply_vrr_editor();
+        assert!(!app.vrr_editor.as_ref().unwrap().error.is_empty());
+        assert!(!app.selected_workspace().unwrap().has_changes());
+        app.vrr_editor.as_mut().unwrap().inputs[0].set("40".to_string());
+        app.apply_vrr_editor();
+        assert!(app.vrr_editor.is_none());
+        assert!(app.selected_workspace().unwrap().has_changes());
+        app.open_vrr_editor();
+        assert_eq!(app.vrr_editor.as_ref().unwrap().inputs[0].buffer, "40");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let contents = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(contents.contains("VRR range limits"));
+        assert!(contents.contains("Minimum Hz: [40|]"));
+        app.handle_vrr_editor_key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Esc,
+        ));
+        assert!(app.vrr_editor.is_none());
     }
 
     #[test]

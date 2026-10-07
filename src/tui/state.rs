@@ -49,6 +49,26 @@ pub(super) struct ImportDialog {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct VrrRangeEditor {
+    pub(super) inputs: [TextInput; 2],
+    pub(super) active: usize,
+    pub(super) error: String,
+}
+
+impl VrrRangeEditor {
+    pub(super) fn new(range: crate::edid::VrrRange) -> Self {
+        Self {
+            inputs: [
+                TextInput::new(range.min_hz.to_string()),
+                TextInput::new(range.max_hz.to_string()),
+            ],
+            active: 0,
+            error: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ExportDialog {
     pub(super) path: String,
     pub(super) instructions_path: String,
