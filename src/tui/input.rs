@@ -23,6 +23,7 @@ impl App {
                 }
             },
             KeyCode::Char('e') => self.export_selected_monitor(),
+            KeyCode::Char('R') => self.open_vrr_editor(),
             KeyCode::Char('E') => match self.focus {
                 FocusArea::Detailed => self.edit_selected_detailed(),
                 FocusArea::Standard => self.edit_selected_standard(),
@@ -65,6 +66,19 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.vrr_editor.is_some() {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                if let Some(hitbox) = self.hit_test(mouse.column, mouse.row) {
+                    if matches!(
+                        hitbox.target,
+                        HitTarget::VrrField(_) | HitTarget::ModalButton(_)
+                    ) {
+                        self.activate_hit(hitbox, mouse.column);
+                    }
+                }
+            }
+            return;
+        }
         if self.details_dialog.is_some() {
             match mouse.kind {
                 MouseEventKind::ScrollDown => {
@@ -102,6 +116,18 @@ impl App {
                     ) {
                         self.open_selected_details();
                     }
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.modal_open() => {
+                let delta = if mouse.kind == MouseEventKind::ScrollDown {
+                    3
+                } else {
+                    -3
+                };
+                if let Some(dialog) = self.apply_confirm_dialog.as_mut() {
+                    dialog.scroll_by(delta);
+                } else if let Some(dialog) = self.apply_result_dialog.as_mut() {
+                    dialog.scroll_by(delta);
                 }
             }
             MouseEventKind::ScrollDown => self.move_selection(1),
@@ -150,6 +176,12 @@ impl App {
                     dialog
                         .path
                         .set_cursor_from_column(mouse_column, hitbox.rect, 7);
+                }
+            }
+            HitTarget::VrrField(index) => {
+                if let Some(editor) = self.vrr_editor.as_mut() {
+                    editor.active = index;
+                    editor.inputs[index].set_cursor_from_column(mouse_column, hitbox.rect, 13);
                 }
             }
             HitTarget::ModalButton(button) => self.activate_modal_button(button),
@@ -226,6 +258,7 @@ impl App {
 
     fn activate_global_action(&mut self, action: GlobalAction) {
         match action {
+            GlobalAction::VrrRange => self.open_vrr_editor(),
             GlobalAction::Import => self.open_import_dialog(),
             GlobalAction::Export => self.export_selected_monitor(),
             GlobalAction::SwitchMode => self.switch_selected_monitor_mode(),
@@ -510,6 +543,13 @@ impl App {
     }
 
     fn activate_modal_button(&mut self, button: ModalButton) {
+        if self.vrr_editor.is_some() {
+            match button {
+                ModalButton::Ok => self.apply_vrr_editor(),
+                ModalButton::Cancel => self.vrr_editor = None,
+            }
+            return;
+        }
         if self.import_dialog.is_some() {
             match button {
                 ModalButton::Ok => self.apply_import_dialog(),
@@ -579,6 +619,37 @@ impl App {
             ModalButton::Cancel => {
                 self.detailed_editor = None;
                 self.status = "Detailed resolution edit cancelled.".to_string();
+            }
+        }
+    }
+}
+
+impl App {
+    pub(super) fn handle_vrr_editor_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.vrr_editor = None;
+            }
+            KeyCode::Enter => self.apply_vrr_editor(),
+            _ => {
+                let Some(editor) = self.vrr_editor.as_mut() else {
+                    return;
+                };
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                        editor.active ^= 1
+                    }
+                    KeyCode::Left => editor.inputs[editor.active].move_left(),
+                    KeyCode::Right => editor.inputs[editor.active].move_right(),
+                    KeyCode::Home => editor.inputs[editor.active].cursor = 0,
+                    KeyCode::End => editor.inputs[editor.active].move_end(),
+                    KeyCode::Backspace => editor.inputs[editor.active].backspace(),
+                    KeyCode::Delete => editor.inputs[editor.active].delete(),
+                    KeyCode::Char(value) if value.is_ascii_digit() => {
+                        editor.inputs[editor.active].insert(value)
+                    }
+                    _ => {}
+                }
             }
         }
     }

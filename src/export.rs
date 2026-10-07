@@ -48,7 +48,8 @@ pub fn export_patched_edid(
     output_dir: &Path,
 ) -> Result<ExportResult, ExportError> {
     let edid = monitor.edid.as_ref().ok_or(ExportError::MissingEdid)?;
-    let (patched, insert_location) = insert_detailed_timing(&edid.raw, timing)?;
+    let (mut patched, insert_location) = insert_detailed_timing(&edid.raw, timing)?;
+    crate::edid::clear_detailed_timing_stereo(&mut patched);
     let file_name = custom_edid_file_name(&monitor.connector);
     let path = output_dir.join(&file_name);
     let instructions_path = output_dir.join(instructions_file_name(&monitor.connector));
@@ -268,6 +269,51 @@ mod tests {
         assert!(instructions.contains("drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin"));
         assert!(instructions.contains("monitor=DP-1,1920x1080@"));
         assert!(instructions.contains(",auto,1"));
+    }
+
+    #[test]
+    fn both_export_paths_clear_existing_stereo_flags() {
+        let monitor = crate::demo::monitors().unwrap().remove(0);
+        let mut monitor = monitor;
+        let mut raw = monitor.edid.as_ref().unwrap().raw.clone();
+        raw[71] |= 0x61;
+        raw[154] |= 0x61;
+        // Repair fixture checksums before exercising validation and export.
+        for block in raw.chunks_exact_mut(128) {
+            block[127] = 0u8.wrapping_sub(
+                block[..127]
+                    .iter()
+                    .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+            );
+        }
+        monitor.edid = Some(crate::edid::parse_edid(raw.clone()).unwrap());
+        let directory = std::env::temp_dir().join(format!(
+            "drmcru-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let workspace = EdidWorkspace::new(raw).unwrap();
+        for workspace_export in [true, false] {
+            let result = if workspace_export {
+                export_workspace_edid(&monitor, &workspace, "2560x1440@144", &directory)
+            } else {
+                export_patched_edid(&monitor, &sample_timing(), &directory)
+            };
+            let result = result.unwrap();
+            let bytes = fs::read(result.path).unwrap();
+            assert_eq!(bytes[71] & 0x61, 0);
+            assert_eq!(bytes[154] & 0x61, 0);
+            assert!(
+                bytes
+                    .chunks_exact(128)
+                    .all(crate::edid::block_checksum_valid)
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use crate::edid::{
     CtaDtdSlot, DtdLocation, EdidError, EdidSlotSummary, LocatedStandardTiming,
-    block_checksum_valid, cta_dtd_slots, delete_detailed_timing, delete_standard_timing,
-    detailed_timing_locations, insert_cta_detailed_timing, insert_detailed_timing,
-    insert_standard_timing, parse_edid, patch_detailed_timing, patch_standard_timing, slot_summary,
-    standard_timing_locations,
+    block_checksum_valid, clear_detailed_timing_stereo, cta_dtd_slots, delete_detailed_timing,
+    delete_standard_timing, detailed_timing_locations, insert_cta_detailed_timing,
+    insert_detailed_timing, insert_standard_timing, parse_edid, patch_detailed_timing,
+    patch_standard_timing, slot_summary, standard_timing_locations, swap_detailed_timings,
 };
 use crate::models::{EdidData, StandardTiming, TimingDescriptor};
 use std::path::Path;
@@ -18,6 +18,9 @@ pub struct EdidWorkspace {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkspaceOperation {
+    SetVrrRange {
+        range: crate::edid::VrrRange,
+    },
     AddDtd {
         location: DtdLocation,
         timing: TimingDescriptor,
@@ -90,8 +93,16 @@ impl EdidWorkspace {
         &self.working
     }
 
+    pub fn set_vrr_range(&mut self, range: crate::edid::VrrRange) -> Result<(), WorkspaceError> {
+        let raw = crate::edid::patch_vrr_range(&self.working.raw, range)?;
+        self.replace_working_raw(raw)?;
+        self.operations
+            .push(WorkspaceOperation::SetVrrRange { range });
+        Ok(())
+    }
+
     pub fn has_changes(&self) -> bool {
-        self.original_raw != self.working.raw
+        self.original_raw != self.export_bytes()
     }
 
     pub fn add_dtd(&mut self, timing: TimingDescriptor) -> Result<DtdLocation, WorkspaceError> {
@@ -221,8 +232,7 @@ impl EdidWorkspace {
 
         let current = &dtds[index];
         let target = &dtds[target_index];
-        let raw = patch_detailed_timing(&self.working.raw, current.location, &target.timing)?;
-        let raw = patch_detailed_timing(&raw, target.location, &current.timing)?;
+        let raw = swap_detailed_timings(&self.working.raw, current.location, target.location)?;
         let from = current.location;
         let to = target.location;
 
@@ -295,21 +305,31 @@ impl EdidWorkspace {
     }
 
     pub fn diff_summary(&self) -> Vec<String> {
-        if self.original_raw == self.working.raw {
+        let mut exported = self.working.raw.clone();
+        let cleared = clear_detailed_timing_stereo(&mut exported);
+        if self.original_raw == exported {
             return vec!["No EDID byte changes.".to_string()];
         }
 
         let changed_bytes = self
             .original_raw
             .iter()
-            .zip(self.working.raw.iter())
+            .zip(exported.iter())
             .filter(|(original, working)| original != working)
             .count()
-            + self.original_raw.len().abs_diff(self.working.raw.len());
+            + self.original_raw.len().abs_diff(exported.len());
 
         let mut summary = vec![format!("{changed_bytes} EDID bytes changed.")];
+        if cleared > 0 {
+            summary.push(format!(
+                "Clear stereo flags from {cleared} detailed timings on export"
+            ));
+        }
         for operation in &self.operations {
             summary.push(match operation {
+                WorkspaceOperation::SetVrrRange { range } => {
+                    format!("Set VRR range to {}–{} Hz", range.min_hz, range.max_hz)
+                }
                 WorkspaceOperation::AddDtd { location, timing } => {
                     format!(
                         "Added {} at {}",
@@ -359,8 +379,10 @@ impl EdidWorkspace {
         summary
     }
 
-    pub fn export_bytes(&self) -> &[u8] {
-        &self.working.raw
+    pub fn export_bytes(&self) -> Vec<u8> {
+        let mut raw = self.working.raw.clone();
+        clear_detailed_timing_stereo(&mut raw);
+        raw
     }
 
     fn replace_working_raw(&mut self, raw: Vec<u8>) -> Result<(), WorkspaceError> {
@@ -419,6 +441,22 @@ mod tests {
             v_sync_positive: false,
             interlaced: false,
         }
+    }
+
+    #[test]
+    fn reordering_moves_complete_descriptors_including_sync_and_size() {
+        let mut raw = minimal_base_edid(0);
+        raw = patch_base_detailed_timing(&raw, 0, &sample_timing()).unwrap();
+        raw = patch_base_detailed_timing(&raw, 1, &alternate_timing()).unwrap();
+        raw[54 + 12..54 + 18].copy_from_slice(&[1, 2, 3, 4, 5, 0x10]);
+        raw[72 + 12..72 + 18].copy_from_slice(&[6, 7, 8, 9, 10, 0x1e]);
+        let first = raw[54..72].to_vec();
+        let second = raw[72..90].to_vec();
+        let mut workspace = EdidWorkspace::new(raw).unwrap();
+        workspace.move_dtd(0, MoveDirection::Down).unwrap();
+        assert_eq!(&workspace.export_bytes()[54..72], second);
+        assert_eq!(&workspace.export_bytes()[72..90], first);
+        assert!(workspace.validate().is_empty());
     }
 
     fn alternate_timing() -> TimingDescriptor {
@@ -483,6 +521,56 @@ mod tests {
                 .any(|line| line.contains("Added"))
         );
         assert!(workspace.validate().is_empty());
+    }
+
+    #[test]
+    fn stereo_only_override_is_pending_and_leaves_the_source_edid_untouched() {
+        let mut raw =
+            patch_base_detailed_timing(&minimal_base_edid(0), 0, &sample_timing()).unwrap();
+        raw[71] |= 0x61;
+        repair_checksum(&mut raw);
+        let workspace = EdidWorkspace::new(raw.clone()).unwrap();
+        assert!(workspace.has_changes());
+        assert_eq!(workspace.parsed().raw, raw);
+        assert_eq!(workspace.export_bytes()[71] & 0x61, 0);
+        assert!(block_checksum_valid(&workspace.export_bytes()));
+        assert!(
+            workspace
+                .diff_summary()
+                .iter()
+                .any(|line| line.contains("stereo flags"))
+        );
+    }
+
+    #[test]
+    fn range_changes_export_with_a_valid_checksum_and_can_be_reset() {
+        let mut raw = minimal_base_edid(0);
+        raw[18] = 1;
+        raw[19] = 4;
+        raw[24] = 1;
+        raw[54..72].copy_from_slice(&[
+            0, 0, 0, 0xfd, 0, 24, 120, 30, 200, 60, 1, 10, 0, 0, 0, 0, 0, 0,
+        ]);
+        repair_checksum(&mut raw);
+        let mut workspace = EdidWorkspace::new(raw.clone()).unwrap();
+        workspace
+            .set_vrr_range(crate::edid::VrrRange {
+                min_hz: 40,
+                max_hz: 120,
+            })
+            .unwrap();
+        assert!(workspace.has_changes());
+        assert!(
+            workspace
+                .diff_summary()
+                .iter()
+                .any(|line| line.contains("40–120 Hz"))
+        );
+        assert!(block_checksum_valid(&workspace.export_bytes()));
+        assert_eq!(workspace.export_bytes()[59], 40);
+        workspace.reset().unwrap();
+        assert_eq!(workspace.export_bytes(), raw);
+        assert!(!workspace.has_changes());
     }
 
     #[test]

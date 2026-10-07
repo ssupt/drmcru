@@ -27,6 +27,68 @@ pub enum EdidError {
     NoAvailableDetailedTimingSlot,
     #[error("no empty standard timing slot is available")]
     NoAvailableStandardTimingSlot,
+    #[error(
+        "no EDID 1.4 range-limits-only VRR descriptor is available; HDMI and DisplayID VRR blocks are not editable"
+    )]
+    NoVrrRange,
+    #[error("VRR limits must be whole Hz between 1 and 510, with minimum <= maximum")]
+    InvalidVrrRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrrRange {
+    pub min_hz: u16,
+    pub max_hz: u16,
+}
+
+fn vrr_descriptor_offsets(raw: &[u8]) -> Result<Vec<usize>, EdidError> {
+    if raw.len() < BASE_BLOCK_LEN {
+        return Err(EdidError::TooShort(raw.len()));
+    }
+    if raw[..8] != HEADER {
+        return Err(EdidError::InvalidHeader);
+    }
+    // Match DRM's monitor-range requirements without inventing VRR support.
+    if raw[18] != 1 || raw[19] < 4 || raw[24] & 1 == 0 {
+        return Err(EdidError::NoVrrRange);
+    }
+    let offsets: Vec<_> = (0..DTD_SLOTS)
+        .map(|slot| DTD_START + slot * DTD_LEN)
+        .filter(|&offset| {
+            let descriptor = &raw[offset..offset + DTD_LEN];
+            descriptor[..4] == [0, 0, 0, 0xfd] && descriptor[10] == 1
+        })
+        .collect();
+    if offsets.is_empty() {
+        return Err(EdidError::NoVrrRange);
+    }
+    Ok(offsets)
+}
+
+pub fn vrr_range(raw: &[u8]) -> Result<VrrRange, EdidError> {
+    let offset = vrr_descriptor_offsets(raw)?[0];
+    let descriptor = &raw[offset..offset + DTD_LEN];
+    Ok(VrrRange {
+        min_hz: u16::from(descriptor[5]) + if descriptor[4] & 1 != 0 { 255 } else { 0 },
+        max_hz: u16::from(descriptor[6]) + if descriptor[4] & 2 != 0 { 255 } else { 0 },
+    })
+}
+
+pub fn patch_vrr_range(raw: &[u8], range: VrrRange) -> Result<Vec<u8>, EdidError> {
+    if range.min_hz == 0 || range.min_hz > range.max_hz || range.max_hz > 510 {
+        return Err(EdidError::InvalidVrrRange);
+    }
+    let offsets = vrr_descriptor_offsets(raw)?;
+    let mut patched = raw.to_vec();
+    for offset in offsets {
+        patched[offset + 4] = (patched[offset + 4] & !0x03)
+            | u8::from(range.min_hz > 255)
+            | (u8::from(range.max_hz > 255) << 1);
+        patched[offset + 5] = (range.min_hz - if range.min_hz > 255 { 255 } else { 0 }) as u8;
+        patched[offset + 6] = (range.max_hz - if range.max_hz > 255 { 255 } else { 0 }) as u8;
+    }
+    repair_block_checksum(&mut patched[..BASE_BLOCK_LEN]);
+    Ok(patched)
 }
 
 const HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
@@ -409,6 +471,22 @@ pub fn delete_detailed_timing(raw: &[u8], location: DtdLocation) -> Result<Vec<u
     Ok(patched)
 }
 
+pub fn swap_detailed_timings(
+    raw: &[u8],
+    first: DtdLocation,
+    second: DtdLocation,
+) -> Result<Vec<u8>, EdidError> {
+    let (first_offset, first_block) = dtd_offset(raw, first)?;
+    let (second_offset, second_block) = dtd_offset(raw, second)?;
+    let mut patched = raw.to_vec();
+    for index in 0..DTD_LEN {
+        patched.swap(first_offset + index, second_offset + index);
+    }
+    repair_block_checksum(&mut patched[first_block..first_block + EDID_BLOCK_LEN]);
+    repair_block_checksum(&mut patched[second_block..second_block + EDID_BLOCK_LEN]);
+    Ok(patched)
+}
+
 #[cfg(test)]
 pub fn patch_base_detailed_timing(
     raw: &[u8],
@@ -610,6 +688,11 @@ pub fn encode_standard_timing(
         StandardTimingAspect::SixteenNine => 0b11,
     };
     let refresh_bits = (timing.refresh_hz - 60) as u8;
+    if width_byte == 0x01 && aspect_bits == 0 && refresh_bits == 0x01 {
+        return Err(EdidError::InvalidStandardTiming(
+            "256x160 at 61 Hz encodes the unused-slot marker",
+        ));
+    }
     Ok([width_byte, aspect_bits << 6 | refresh_bits])
 }
 
@@ -624,6 +707,43 @@ fn repair_block_checksum(block: &mut [u8]) {
         .iter()
         .fold(0u8, |acc, byte| acc.wrapping_add(*byte));
     block[last] = 0u8.wrapping_sub(sum_without_checksum);
+}
+
+/// Remove stereoscopic DTD flags from a desktop EDID override. Preserve sync,
+/// interlace, monitor descriptors, data blocks, and unsupported extensions.
+pub fn clear_detailed_timing_stereo(raw: &mut [u8]) -> usize {
+    if raw.len() < BASE_BLOCK_LEN || raw[..8] != HEADER {
+        return 0;
+    }
+    let extension_blocks = raw[126];
+    let mut cleared = 0;
+    for (index, block) in raw.chunks_exact_mut(EDID_BLOCK_LEN).enumerate() {
+        if index > usize::from(extension_blocks) {
+            break;
+        }
+        let range = if index == 0 {
+            DTD_START..126
+        } else if block[0] == CTA_TAG {
+            let Some(range) = cta_dtd_range(block) else {
+                continue;
+            };
+            range
+        } else {
+            continue;
+        };
+        let mut changed = false;
+        for descriptor in block[range].chunks_exact_mut(DTD_LEN) {
+            if (descriptor[0] != 0 || descriptor[1] != 0) && descriptor[17] & 0x61 != 0 {
+                descriptor[17] &= !0x61;
+                cleared += 1;
+                changed = true;
+            }
+        }
+        if changed {
+            repair_block_checksum(block);
+        }
+    }
+    cleared
 }
 
 fn validate_12_bit(field: &'static str, value: u16) -> Result<(), EdidError> {
@@ -716,7 +836,10 @@ fn parse_displayid_block(extension_index: u8, block: &[u8]) -> Option<DisplayIdB
     let mut data_block_index = 0;
     while offset + DISPLAYID_DATA_BLOCK_HEADER_LEN <= payload_end {
         let tag = block[offset];
-        if tag == 0 {
+        if block[offset..offset + DISPLAYID_DATA_BLOCK_HEADER_LEN]
+            .iter()
+            .all(|byte| *byte == 0)
+        {
             break;
         }
         let revision = block[offset + 1];
@@ -920,8 +1043,12 @@ fn parse_cta_video_modes(payload: &[u8]) -> Vec<CtaVideoDescriptor> {
     payload
         .iter()
         .map(|descriptor| {
-            let native = descriptor & 0x80 != 0;
-            let vic = u16::from(descriptor & 0x7f);
+            let native = (129..=192).contains(descriptor);
+            let vic = u16::from(if native {
+                descriptor & 0x7f
+            } else {
+                *descriptor
+            });
             cta_vic_mode(vic, native)
                 .map(CtaVideoDescriptor::Known)
                 .unwrap_or(CtaVideoDescriptor::Unknown { vic, native })
@@ -1246,6 +1373,170 @@ mod tests {
         ));
     }
 
+    fn sample_vrr_edid() -> Vec<u8> {
+        let mut raw = minimal_base_edid(0);
+        raw[18] = 1;
+        raw[19] = 4;
+        raw[24] |= 1;
+        raw[54..72].copy_from_slice(&[
+            0, 0, 0, 0xfd, 0x0c, 24, 120, 30, 200, 60, 1, 10, 0, 0, 0, 0, 0, 0,
+        ]);
+        repair_block_checksum(&mut raw);
+        raw
+    }
+
+    #[test]
+    fn edits_vrr_range_and_preserves_other_limits() {
+        let raw = sample_vrr_edid();
+        assert_eq!(
+            vrr_range(&raw).unwrap(),
+            VrrRange {
+                min_hz: 24,
+                max_hz: 120
+            }
+        );
+        for range in [
+            VrrRange {
+                min_hz: 40,
+                max_hz: 120,
+            },
+            VrrRange {
+                min_hz: 255,
+                max_hz: 256,
+            },
+            VrrRange {
+                min_hz: 300,
+                max_hz: 510,
+            },
+        ] {
+            let patched = patch_vrr_range(&raw, range).unwrap();
+            assert_eq!(vrr_range(&patched).unwrap(), range);
+            assert_eq!(patched[58] & 0x0c, 0x0c);
+            assert!(block_checksum_valid(&patched));
+            for index in 0..raw.len() {
+                if ![58, 59, 60, 127].contains(&index) {
+                    assert_eq!(patched[index], raw[index]);
+                }
+            }
+            let lowered = patch_vrr_range(
+                &patched,
+                VrrRange {
+                    min_hz: 40,
+                    max_hz: 120,
+                },
+            )
+            .unwrap();
+            assert_eq!(lowered[58], 0x0c);
+        }
+    }
+
+    #[test]
+    fn vrr_edits_reject_invalid_ranges_and_unadvertised_capabilities() {
+        let raw = sample_vrr_edid();
+        for range in [
+            VrrRange {
+                min_hz: 0,
+                max_hz: 120,
+            },
+            VrrRange {
+                min_hz: 121,
+                max_hz: 120,
+            },
+            VrrRange {
+                min_hz: 40,
+                max_hz: 511,
+            },
+        ] {
+            assert!(matches!(
+                patch_vrr_range(&raw, range),
+                Err(EdidError::InvalidVrrRange)
+            ));
+        }
+        for (index, value) in [(18, 2), (19, 3), (24, 0), (57, 0xfc), (64, 0)] {
+            let mut unsupported = raw.clone();
+            unsupported[index] = value;
+            assert!(matches!(
+                vrr_range(&unsupported),
+                Err(EdidError::NoVrrRange)
+            ));
+        }
+        assert!(matches!(
+            vrr_range(&raw[..127]),
+            Err(EdidError::TooShort(127))
+        ));
+    }
+
+    #[test]
+    fn clears_all_stereo_encodings_without_changing_other_dtd_fields() {
+        for stereo in [0x01, 0x20, 0x21, 0x40, 0x41, 0x60, 0x61] {
+            let mut raw = minimal_base_edid(1);
+            let mut descriptor = encode_detailed_timing(&sample_timing()).unwrap();
+            descriptor[17] = 0x9e | stereo;
+            raw[54..72].copy_from_slice(&descriptor);
+            // A monitor descriptor's last byte is text, not timing flags.
+            raw[75] = 0xfc;
+            raw[89] = 0x61;
+            repair_block_checksum(&mut raw);
+            let mut cta = vec![0; 128];
+            cta[0] = CTA_TAG;
+            cta[1] = 3;
+            cta[2] = 8;
+            cta[4..8].copy_from_slice(&[0x63, 0x61, 0x61, 0x61]);
+            cta[8..26].copy_from_slice(&descriptor);
+            repair_block_checksum(&mut cta);
+            raw.extend_from_slice(&cta);
+            let before = raw.clone();
+            assert_eq!(clear_detailed_timing_stereo(&mut raw), 2);
+            assert_eq!(raw[71], 0x9e);
+            assert_eq!(raw[153], 0x9e);
+            for index in 0..raw.len() {
+                if ![71, 127, 153, 255].contains(&index) {
+                    assert_eq!(raw[index], before[index]);
+                }
+            }
+            assert!(raw.chunks_exact(128).all(block_checksum_valid));
+            assert_eq!(clear_detailed_timing_stereo(&mut raw), 0);
+        }
+    }
+
+    #[test]
+    fn displayid_product_id_does_not_hide_following_timings() {
+        let mut edid = minimal_base_edid(1);
+        let mut block = [0u8; 128];
+        block[0] = DISPLAYID_TAG;
+        block[1] = 0x13;
+        block[2] = 30;
+        block[5..12].copy_from_slice(&[0, 0, 4, 1, 2, 3, 4]);
+        block[12..15].copy_from_slice(&[3, 1, 20]);
+        block[15..35].copy_from_slice(&[
+            0x19, 0x13, 0x01, 0x84, 0xff, 0x09, 0xaf, 0x00, 0x2f, 0x00, 0x1f, 0x00, 0x9f, 0x05,
+            0x77, 0x00, 0x02, 0x00, 0x05, 0x00,
+        ]);
+        repair_block_checksum(&mut block);
+        edid.extend_from_slice(&block);
+        let parsed = parse_edid(edid).unwrap();
+        let displayid = &parsed.displayid_blocks[0];
+        assert_eq!(displayid.data_blocks.len(), 2);
+        assert_eq!(displayid.data_blocks[0].label(), "Product ID");
+        assert_eq!(displayid.detailed_timings.len(), 1);
+    }
+
+    #[test]
+    fn cta_extended_video_codes_do_not_alias_legacy_native_modes() {
+        assert_eq!(
+            parse_cta_video_modes(&[193]),
+            vec![CtaVideoDescriptor::Unknown {
+                vic: 193,
+                native: false
+            }]
+        );
+        let CtaVideoDescriptor::Known(mode) = &parse_cta_video_modes(&[144])[0] else {
+            panic!("native VIC 16 should be mapped");
+        };
+        assert_eq!(mode.vic, 16);
+        assert!(mode.native);
+    }
+
     #[test]
     fn parses_and_deletes_standard_timing() {
         let mut edid = minimal_base_edid(0);
@@ -1320,6 +1611,18 @@ mod tests {
             encode_standard_timing(&timing),
             Err(EdidError::InvalidStandardTiming(_))
         ));
+    }
+
+    #[test]
+    fn standard_timing_cannot_encode_the_unused_slot_marker() {
+        let timing = StandardTiming {
+            slot: 0,
+            width: 256,
+            height: 160,
+            refresh_hz: 61,
+            aspect: StandardTimingAspect::SixteenTen,
+        };
+        assert!(encode_standard_timing(&timing).is_err());
     }
 
     #[test]

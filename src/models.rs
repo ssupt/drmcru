@@ -105,13 +105,14 @@ pub struct DisplayIdDataBlock {
 impl DisplayIdDataBlock {
     pub fn label(&self) -> String {
         match self.tag {
+            0x00 | 0x20 => "Product ID".to_string(),
+            0x01 | 0x21 => "Display parameters".to_string(),
+            0x02 => "Color characteristics".to_string(),
             0x03 => "Type I timings".to_string(),
             0x04 => "Type II timings".to_string(),
             0x05 => "Type III timings".to_string(),
             0x12 => "Tiled display".to_string(),
-            0x20 => "Product ID".to_string(),
-            0x21 => "Display parameters".to_string(),
-            0x22 => "Color characteristics".to_string(),
+            0x22 => "Type VII timings".to_string(),
             tag => format!("DisplayID tag 0x{tag:02x}"),
         }
     }

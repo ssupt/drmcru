@@ -106,11 +106,12 @@ pub fn cvt_reduced_blanking(request: CvtRequest) -> TimingDescriptor {
     let estimated_h_period_us =
         ((1_000_000.0 / refresh_hz) - RB_MIN_VBLANK_US) / f64::from(v_active);
     let min_vbi_lines = V_FRONT_PORCH + v_sync_width + MIN_V_BACK_PORCH;
-    let rb_vbi_lines = (RB_MIN_VBLANK_US / estimated_h_period_us).floor() as u16 + 1;
+    let rb_vbi_lines =
+        ((RB_MIN_VBLANK_US / estimated_h_period_us).floor() as u16).saturating_add(1);
     let v_blanking = rb_vbi_lines.max(min_vbi_lines);
     let v_total = u32::from(v_active) + u32::from(v_blanking);
     let pixel_clock_khz = round_down_to_step(
-        f64::from(h_total * v_total) * refresh_hz / 1000.0,
+        f64::from(h_total) * f64::from(v_total) * refresh_hz / 1000.0,
         CLOCK_STEP_KHZ,
     );
 
@@ -195,8 +196,14 @@ fn exact_timing(request: CvtRequest, current: Option<&TimingDescriptor>) -> Timi
         v_active: request.height,
         ..base
     };
-    timing.h_blanking = timing.h_front_porch + timing.h_sync_width + timing.h_back_porch;
-    timing.v_blanking = timing.v_front_porch + timing.v_sync_width + timing.v_back_porch;
+    timing.h_blanking = timing
+        .h_front_porch
+        .saturating_add(timing.h_sync_width)
+        .saturating_add(timing.h_back_porch);
+    timing.v_blanking = timing
+        .v_front_porch
+        .saturating_add(timing.v_sync_width)
+        .saturating_add(timing.v_back_porch);
     timing.pixel_clock_khz = exact_pixel_clock_khz(
         u32::from(timing.h_total()),
         u32::from(timing.v_total()),
@@ -223,8 +230,8 @@ fn detailed_from_parts(
     let h_blanking = h_front_porch + h_sync_width + h_back_porch;
     let v_blanking = v_front_porch + v_sync_width + v_back_porch;
     let pixel_clock_khz = exact_pixel_clock_khz(
-        u32::from(h_active + h_blanking),
-        u32::from(v_active + v_blanking),
+        u32::from(h_active) + u32::from(h_blanking),
+        u32::from(v_active) + u32::from(v_blanking),
         refresh_hz,
     );
 
@@ -247,7 +254,7 @@ fn detailed_from_parts(
 }
 
 fn exact_pixel_clock_khz(h_total: u32, v_total: u32, refresh_hz: f64) -> u32 {
-    (f64::from(h_total * v_total) * refresh_hz / 1000.0).round() as u32
+    (f64::from(h_total) * f64::from(v_total) * refresh_hz / 1000.0).round() as u32
 }
 
 fn round_down_to(value: u16, granularity: u16) -> u16 {
@@ -255,7 +262,7 @@ fn round_down_to(value: u16, granularity: u16) -> u16 {
 }
 
 fn round_down_to_step(value: f64, step: u32) -> u32 {
-    ((value / f64::from(step)).floor() as u32) * step
+    ((value / f64::from(step)).floor() * f64::from(step)) as u32
 }
 
 fn vertical_sync_width(width: u16, height: u16) -> u16 {
@@ -293,6 +300,24 @@ mod tests {
         assert_eq!(timing.v_blanking, 31);
         assert_eq!(timing.v_sync_width, 5);
         assert_eq!(timing.pixel_clock_khz, 138_500);
+    }
+
+    #[test]
+    fn extreme_requests_do_not_overflow_before_validation() {
+        for preset in TimingPreset::ALL {
+            for refresh_hz in [60.0, 2173.9, 1e100] {
+                let timing = timing_for_preset(
+                    preset,
+                    CvtRequest {
+                        width: u16::MAX,
+                        height: u16::MAX,
+                        refresh_hz,
+                    },
+                    None,
+                );
+                assert!(!crate::validation::validate_timing(&timing).is_empty());
+            }
+        }
     }
 
     #[test]

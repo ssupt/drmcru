@@ -24,6 +24,61 @@ struct SwitchModeCandidate {
 }
 
 impl App {
+    pub(super) fn open_vrr_editor(&mut self) {
+        if self.modal_open() {
+            self.status = "Close the current dialog before editing the VRR range.".to_string();
+            return;
+        }
+        let result = self
+            .selected_edid()
+            .ok_or_else(|| "Selected monitor has no editable EDID.".to_string())
+            .and_then(|edid| crate::edid::vrr_range(&edid.raw).map_err(|error| error.to_string()));
+        match result {
+            Ok(range) => {
+                self.vrr_editor = Some(super::state::VrrRangeEditor::new(range));
+                self.status =
+                    "Edit the advertised VRR range, then Export or Install/Update and reboot."
+                        .to_string();
+            }
+            Err(error) => self.status = format!("Cannot edit VRR range: {error}"),
+        }
+    }
+
+    pub(super) fn apply_vrr_editor(&mut self) {
+        let Some(editor) = self.vrr_editor.as_ref() else {
+            return;
+        };
+        let range = editor.inputs[0]
+            .buffer
+            .parse::<u16>()
+            .ok()
+            .zip(editor.inputs[1].buffer.parse::<u16>().ok())
+            .map(|(min_hz, max_hz)| crate::edid::VrrRange { min_hz, max_hz });
+        let result = match range {
+            Some(range) => self
+                .selected_workspace_mut()
+                .ok_or_else(|| "Selected monitor has no editable EDID.".to_string())
+                .and_then(|workspace| {
+                    workspace
+                        .set_vrr_range(range)
+                        .map_err(|error| error.to_string())
+                }),
+            None => Err("Enter whole Hz between 1 and 510, with minimum <= maximum.".to_string()),
+        };
+        match result {
+            Ok(()) => {
+                let range = range.unwrap();
+                self.vrr_editor = None;
+                self.status = format!(
+                    "VRR range set to {}–{} Hz. Export or Install/Update and reboot to apply.",
+                    range.min_hz, range.max_hz
+                );
+            }
+            Err(error) => {
+                self.vrr_editor.as_mut().unwrap().error = error;
+            }
+        }
+    }
     pub(super) fn open_detailed_editor(&mut self, mode: EditorMode) {
         self.import_dialog = None;
         self.details_dialog = None;
@@ -525,7 +580,7 @@ impl App {
         {
             Some(()) => {
                 let remaining = self.working_dtds().len();
-                self.selected_detailed = (remaining > 0).then_some(index.min(remaining - 1));
+                self.selected_detailed = remaining.checked_sub(1).map(|last| index.min(last));
                 self.status = format!("Deleted DTD at {}.", format_location(location));
             }
             None => {
@@ -558,8 +613,8 @@ impl App {
             .and_then(|workspace| workspace.delete_dtd(location).ok())
         {
             Some(()) => {
-                let remaining = self.working_cta_dtd_slots().len();
-                self.selected_extension = (remaining > 0).then_some(index.min(remaining - 1));
+                let remaining = self.working_extension_rows().len();
+                self.selected_extension = remaining.checked_sub(1).map(|last| index.min(last));
                 self.status = format!("Deleted DTD at {}.", format_location(location));
             }
             None => {
@@ -632,7 +687,7 @@ impl App {
         {
             Some(()) => {
                 let remaining = self.working_standard_timings().len();
-                self.selected_standard = (remaining > 0).then_some(index.min(remaining - 1));
+                self.selected_standard = remaining.checked_sub(1).map(|last| index.min(last));
                 self.status = format!("Deleted standard timing slot {slot}.");
             }
             None => {
@@ -1021,27 +1076,11 @@ impl App {
                 return issues;
             };
 
-            if !edid.checksum_valid {
-                issues.push("Error: Base EDID checksum is invalid.".to_string());
-            }
-            for cta in &edid.cta_blocks {
-                if !cta.checksum_valid {
-                    issues.push(format!(
-                        "Error: CTA-861 extension {} checksum is invalid.",
-                        cta.extension_index
-                    ));
+            if let Ok(mut workspace) = EdidWorkspace::from_edid(edid) {
+                issues.extend(self.workspace_validation_issues(&workspace));
+                if let Err(error) = workspace.add_dtd(self.draft_timing.clone()) {
+                    issues.push(format!("Error: Cannot insert draft timing: {error}"));
                 }
-            }
-            let free_dtd_slots = self
-                .selected_workspace()
-                .and_then(|workspace| workspace.slot_summary().ok())
-                .map(|summary| summary.base_dtd_free + summary.cta_dtd_free)
-                .unwrap_or(0);
-            if free_dtd_slots == 0 {
-                issues.push(
-                    "Error: No free base or CTA detailed timing slot is visible for draft insertion."
-                        .to_string(),
-                );
             }
             issues.push(
                 "Warning: No workspace EDID changes are pending; export will insert the current draft detailed timing."
@@ -1890,6 +1929,7 @@ fn help_lines() -> Vec<String> {
         "? / h / F1        Open this help",
         "i                 Details for the focused monitor or row",
         "e                 Export patched EDID",
+        "Shift+R           Edit the advertised VRR range",
         "Shift+E           Edit the selected detailed, standard, or CTA DTD row",
         "A                 Install/Update EDID override",
         "u                 Uninstall drmcru EDID override",

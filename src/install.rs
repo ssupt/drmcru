@@ -651,6 +651,7 @@ fn yes_no(value: bool) -> &'static str {
 
 /// Build the idempotent bash install script.
 pub fn build_install_script(plan: &InstallPlan) -> String {
+    let files_awk = include_str!("mkinitcpio_files.awk");
     let edid_source = shell_quote(&plan.edid_source.display().to_string());
     let firmware_target = shell_quote(&plan.firmware_target().display().to_string());
     let kernel_param = shell_quote(&plan.kernel_parameter);
@@ -659,7 +660,7 @@ pub fn build_install_script(plan: &InstallPlan) -> String {
     // The script is idempotent and validates the supported stack before mutating files.
     format!(
         r##"#!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 echo "=== drmcru: installing custom EDID ==="
 
@@ -760,29 +761,12 @@ echo "[OK] Installed EDID to $FIRMWARE_TARGET"
 
 # 2. Patch /etc/mkinitcpio.conf — add EDID to FILES if not already present
 if [ -f "$MKINIT" ]; then
-    if grep -qF -- "$FIRMWARE_TARGET" "$MKINIT" 2>/dev/null; then
-        echo "[OK] EDID already in mkinitcpio FILES (skipped)"
-    else
-        backup_file "$MKINIT"
-        TMP="$(mktemp /tmp/drmcru-mkinitcpio.XXXXXX)"
-        awk -v path="$FIRMWARE_TARGET" '
-            BEGIN {{ inserted = 0 }}
-            /^[[:space:]]*FILES=\(/ && !inserted {{
-                sub(/\(/, "(" path " ")
-                inserted = 1
-            }}
-            {{ print }}
-            END {{
-                if (!inserted) {{
-                    print ""
-                    print "FILES=(" path ")"
-                }}
-            }}
-        ' "$MKINIT" > "$TMP"
-        cat "$TMP" > "$MKINIT"
-        rm -f "$TMP"
-        echo "[OK] Added EDID to mkinitcpio FILES"
-    fi
+    backup_file "$MKINIT"
+    TMP="$(mktemp /tmp/drmcru-mkinitcpio.XXXXXX)"
+    awk -v path="$FIRMWARE_TARGET" -v operation=add '{files_awk}' "$MKINIT" > "$TMP"
+    cat "$TMP" > "$MKINIT"
+    rm -f "$TMP"
+    echo "[OK] Ensured EDID is in mkinitcpio FILES"
 else
     echo "[ERR] /etc/mkinitcpio.conf not found — automatic Apply supports mkinitcpio only" >&2
     exit 1
@@ -803,20 +787,25 @@ if command -v limine-mkinitcpio >/dev/null 2>&1; then
                     mappings[++mapping_count] = mapping
             }}
             /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=/ && index($0, "drm.edid_firmware=") > 0 {{
-                value = substr($0, index($0, "drm.edid_firmware=") + length("drm.edid_firmware="))
-                sub(/[\"[:space:]].*$/, "", value)
-                count = split(value, values, ",")
-                for (i = 1; i <= count; i++)
-                    add_mapping(values[i])
+                line = $0
+                while (match(line, /drm.edid_firmware=[^\"\047[:space:]]*/)) {{
+                    value = substr(line, RSTART + length("drm.edid_firmware="), RLENGTH - length("drm.edid_firmware="))
+                    line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
+                    count = split(value, values, ",")
+                    for (i = 1; i <= count; i++)
+                        add_mapping(values[i])
+                }}
+                if (line !~ /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=[\"\047][[:space:]]*[\"\047][[:space:]]*$/)
+                    print line
                 next
             }}
             {{ print }}
             END {{
                 desired = substr(param, length("drm.edid_firmware=") + 1)
-                add_mapping(desired)
                 combined = ""
                 for (i = 1; i <= mapping_count; i++)
                     combined = combined (combined == "" ? "" : ",") mappings[i]
+                combined = combined (combined == "" ? "" : ",") desired
                 print "KERNEL_CMDLINE[default]+=\" drm.edid_firmware=" combined "\""
             }}
         ' "$LIMINE_DROPIN" > "$TMP"
@@ -853,21 +842,24 @@ if [ -f "$LIMINE" ]; then
                 mapping_count = 0
                 prefix = substr($0, 1, index($0, ":"))
                 other = ""
-                for (i = 2; i <= NF; i++) {{
-                    if (index($i, "drm.edid_firmware=") == 1) {{
-                        value = substr($i, length("drm.edid_firmware=") + 1)
+                token_count = split(substr($0, index($0, ":") + 1), tokens, /[[:space:]]+/)
+                for (i = 1; i <= token_count; i++) {{
+                    if (tokens[i] == "")
+                        continue
+                    if (index(tokens[i], "drm.edid_firmware=") == 1) {{
+                        value = substr(tokens[i], length("drm.edid_firmware=") + 1)
                         count = split(value, values, ",")
                         for (j = 1; j <= count; j++)
                             add_mapping(values[j])
                     }} else {{
-                        other = other (other == "" ? "" : " ") $i
+                        other = other (other == "" ? "" : " ") tokens[i]
                     }}
                 }}
                 desired = substr(param, length("drm.edid_firmware=") + 1)
-                add_mapping(desired)
                 combined = ""
                 for (i = 1; i <= mapping_count; i++)
                     combined = combined (combined == "" ? "" : ",") mappings[i]
+                combined = combined (combined == "" ? "" : ",") desired
                 print prefix (other == "" ? "" : " " other) " drm.edid_firmware=" combined
                 next
             }}
@@ -913,13 +905,14 @@ fn shell_quote(value: &str) -> String {
 
 /// Build the idempotent bash uninstall script.
 pub fn build_uninstall_script(plan: &UninstallPlan) -> String {
+    let files_awk = include_str!("mkinitcpio_files.awk");
     let firmware_target = shell_quote(&plan.firmware_target().display().to_string());
     let kernel_param = shell_quote(&plan.kernel_parameter);
     let connector = shell_quote(&plan.connector);
 
     format!(
         r##"#!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
 echo "=== drmcru: uninstalling custom EDID ==="
 
@@ -1004,17 +997,7 @@ if [ -f "$MKINIT" ]; then
     if grep -qF -- "$FIRMWARE_TARGET" "$MKINIT" 2>/dev/null; then
         backup_file "$MKINIT"
         TMP="$(mktemp /tmp/drmcru-mkinitcpio.XXXXXX)"
-        awk -v path="$FIRMWARE_TARGET" '
-            /^[[:space:]]*FILES=\(/ {{
-                while ((pos = index($0, path)) > 0) {{
-                    before = substr($0, 1, pos - 1)
-                    after = substr($0, pos + length(path))
-                    sub(/^[[:space:]]+/, "", after)
-                    $0 = before after
-                }}
-            }}
-            {{ print }}
-        ' "$MKINIT" > "$TMP"
+        awk -v path="$FIRMWARE_TARGET" -v operation=remove '{files_awk}' "$MKINIT" > "$TMP"
         cat "$TMP" > "$MKINIT"
         rm -f "$TMP"
         echo "[OK] Removed EDID from mkinitcpio FILES"
@@ -1039,11 +1022,16 @@ if [ -f "$LIMINE_DROPIN" ]; then
                     mappings[++mapping_count] = mapping
             }}
             /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=/ && index($0, "drm.edid_firmware=") > 0 {{
-                value = substr($0, index($0, "drm.edid_firmware=") + length("drm.edid_firmware="))
-                sub(/[\"[:space:]].*$/, "", value)
-                count = split(value, values, ",")
-                for (i = 1; i <= count; i++)
-                    add_mapping(values[i])
+                line = $0
+                while (match(line, /drm.edid_firmware=[^\"\047[:space:]]*/)) {{
+                    value = substr(line, RSTART + length("drm.edid_firmware="), RLENGTH - length("drm.edid_firmware="))
+                    line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
+                    count = split(value, values, ",")
+                    for (i = 1; i <= count; i++)
+                        add_mapping(values[i])
+                }}
+                if (line !~ /^[[:space:]]*KERNEL_CMDLINE\[default\]\+=[\"\047][[:space:]]*[\"\047][[:space:]]*$/)
+                    print line
                 next
             }}
             {{ print }}
@@ -1090,14 +1078,17 @@ if [ -f "$LIMINE" ]; then
                 mapping_count = 0
                 prefix = substr($0, 1, index($0, ":"))
                 other = ""
-                for (i = 2; i <= NF; i++) {{
-                    if (index($i, "drm.edid_firmware=") == 1) {{
-                        value = substr($i, length("drm.edid_firmware=") + 1)
+                token_count = split(substr($0, index($0, ":") + 1), tokens, /[[:space:]]+/)
+                for (i = 1; i <= token_count; i++) {{
+                    if (tokens[i] == "")
+                        continue
+                    if (index(tokens[i], "drm.edid_firmware=") == 1) {{
+                        value = substr(tokens[i], length("drm.edid_firmware=") + 1)
                         count = split(value, values, ",")
                         for (j = 1; j <= count; j++)
                             add_mapping(values[j])
                     }} else {{
-                        other = other (other == "" ? "" : " ") $i
+                        other = other (other == "" ? "" : " ") tokens[i]
                     }}
                 }}
                 combined = ""
@@ -1288,6 +1279,265 @@ mod tests {
         std::env::temp_dir().join(format!("drmcru-install-test-{}-{now}", std::process::id()))
     }
 
+    struct ScriptFixture {
+        dir: PathBuf,
+    }
+
+    impl ScriptFixture {
+        fn new() -> Self {
+            let dir = unique_test_dir();
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::create_dir_all(dir.join("firmware")).unwrap();
+            fs::create_dir_all(dir.join("entry-tool")).unwrap();
+            fs::write(dir.join("source.bin"), b"new-edid").unwrap();
+            fs::write(dir.join("mkinitcpio.conf"), "FILES=()\n").unwrap();
+            fs::write(dir.join("limine.conf"), "cmdline: quiet\n").unwrap();
+            let fixture = Self { dir };
+            fixture.command("id", "printf '0\\n'");
+            fixture.command("mkinitcpio", "exit 0");
+            fixture.command("limine-mkinitcpio", "exit 0");
+            fixture
+        }
+
+        fn command(&self, name: &str, body: &str) {
+            let path = self.dir.join("bin").join(name);
+            fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn run(&self, uninstall: bool) -> std::process::Output {
+            let script = if uninstall {
+                build_uninstall_script(&sample_uninstall_plan())
+            } else {
+                let mut plan = sample_plan();
+                plan.edid_source = self.dir.join("source.bin");
+                build_install_script(&plan)
+            };
+            let script = script
+                .replace(
+                    "/lib/firmware/edid",
+                    &self.dir.join("firmware").display().to_string(),
+                )
+                .replace(
+                    "/etc/mkinitcpio.conf",
+                    &self.dir.join("mkinitcpio.conf").display().to_string(),
+                )
+                .replace(
+                    "/boot/limine.conf",
+                    &self.dir.join("limine.conf").display().to_string(),
+                )
+                .replace(
+                    "/etc/limine-entry-tool.d",
+                    &self.dir.join("entry-tool").display().to_string(),
+                )
+                .replace(
+                    "/etc/mkinitcpio.d",
+                    &self.dir.join("presets").display().to_string(),
+                );
+            Command::new("bash")
+                .args(["-c", &script])
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        self.dir.join("bin").display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .output()
+                .unwrap()
+        }
+
+        fn firmware(&self) -> PathBuf {
+            self.dir.join("firmware/drmcru_custom_DP-1.bin")
+        }
+    }
+
+    impl Drop for ScriptFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn install_updates_mapping_and_preserves_other_connectors_on_repeated_runs() {
+        let fixture = ScriptFixture::new();
+        let other = "HDMI-A-1:edid/other.bin";
+        fs::write(
+            fixture.dir.join("limine.conf"),
+            format!("cmdline: quiet drm.edid_firmware=DP-1:edid/old.bin,{other}\ncmdline: debug\n"),
+        )
+        .unwrap();
+        fs::write(
+            fixture.dir.join("entry-tool/drmcru-edid.conf"),
+            format!("KERNEL_CMDLINE[default]+=\" drm.edid_firmware=DP-1:edid/old.bin,{other}\"\n"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let output = fixture.run(false);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let limine = fs::read_to_string(fixture.dir.join("limine.conf")).unwrap();
+            for line in limine.lines() {
+                assert!(
+                    text_contains_kernel_mapping(line, &sample_plan().kernel_parameter),
+                    "{line}"
+                );
+                assert_eq!(line.matches("drm.edid_firmware=").count(), 1);
+                assert!(!line.contains("old.bin"));
+            }
+            assert!(limine.lines().next().unwrap().contains(other));
+            let dropin =
+                fs::read_to_string(fixture.dir.join("entry-tool/drmcru-edid.conf")).unwrap();
+            assert!(
+                text_contains_kernel_mapping(&dropin, &sample_plan().kernel_parameter),
+                "{dropin}"
+            );
+            assert!(dropin.contains(other));
+        }
+    }
+
+    #[test]
+    fn install_rolls_back_when_a_backup_helper_fails() {
+        let fixture = ScriptFixture::new();
+        fs::write(fixture.firmware(), b"old-edid").unwrap();
+        let mkinit = fixture.dir.join("mkinitcpio.conf");
+        fixture.command(
+            "cp",
+            &format!(
+                "if [ \"$3\" = {} ]; then exit 42; fi\nexec /usr/bin/cp \"$@\"",
+                shell_quote(&mkinit.display().to_string())
+            ),
+        );
+        let output = fixture.run(false);
+        assert!(!output.status.success());
+        assert_eq!(fs::read(fixture.firmware()).unwrap(), b"old-edid");
+        assert_eq!(fs::read_to_string(mkinit).unwrap(), "FILES=()\n");
+    }
+
+    #[test]
+    fn rebuild_failure_restores_install_and_uninstall_files() {
+        for uninstall in [false, true] {
+            let fixture = ScriptFixture::new();
+            fs::write(fixture.firmware(), b"old-edid").unwrap();
+            let mkinit = format!("FILES=(\"{}\")\n", fixture.firmware().display());
+            let limine = format!("cmdline: quiet {}\n", sample_plan().kernel_parameter);
+            let dropin = format!(
+                "KERNEL_CMDLINE[default]+=\" {}\"\n",
+                sample_plan().kernel_parameter
+            );
+            fs::write(fixture.dir.join("mkinitcpio.conf"), &mkinit).unwrap();
+            fs::write(fixture.dir.join("limine.conf"), &limine).unwrap();
+            fs::write(fixture.dir.join("entry-tool/drmcru-edid.conf"), &dropin).unwrap();
+            fixture.command("limine-mkinitcpio", "exit 42");
+            assert!(!fixture.run(uninstall).status.success());
+            assert_eq!(fs::read(fixture.firmware()).unwrap(), b"old-edid");
+            assert_eq!(
+                fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap(),
+                mkinit
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.dir.join("limine.conf")).unwrap(),
+                limine
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.dir.join("entry-tool/drmcru-edid.conf")).unwrap(),
+                dropin
+            );
+        }
+    }
+
+    #[test]
+    fn install_and_uninstall_preserve_compact_cmdlines_and_dropin_options() {
+        let fixture = ScriptFixture::new();
+        let other = "HDMI-A-1:edid/other.bin";
+        fs::write(
+            fixture.dir.join("limine.conf"),
+            format!("cmdline:quiet drm.edid_firmware=DP-1:edid/old.bin,{other} root=/dev/test\n"),
+        )
+        .unwrap();
+        fs::write(fixture.dir.join("entry-tool/drmcru-edid.conf"), format!("KERNEL_CMDLINE[default]+=\" quiet drm.edid_firmware=DP-1:edid/old.bin,{other} loglevel=3\"\n")).unwrap();
+        for uninstall in [false, true] {
+            let output = fixture.run(uninstall);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let limine = fs::read_to_string(fixture.dir.join("limine.conf")).unwrap();
+            assert!(limine.contains("quiet"), "{limine}");
+            assert!(limine.contains("root=/dev/test"));
+            assert!(limine.contains(other));
+            let dropin =
+                fs::read_to_string(fixture.dir.join("entry-tool/drmcru-edid.conf")).unwrap();
+            assert!(dropin.contains("quiet"), "{dropin}");
+            assert!(dropin.contains("loglevel=3"), "{dropin}");
+            assert!(dropin.contains(other));
+        }
+    }
+
+    #[test]
+    fn install_does_not_mistake_comments_for_files_entries() {
+        let fixture = ScriptFixture::new();
+        let path = fixture.firmware().display().to_string();
+        fs::write(
+            fixture.dir.join("mkinitcpio.conf"),
+            format!("# FILES=({path})\nFILES=(\n /keep.bin # ) is a comment\n)\n"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let output = fixture.run(false);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let config = fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap();
+        assert_eq!(config.matches(&format!("\"{path}\"")).count(), 1);
+        assert!(config.contains("/keep.bin # ) is a comment"));
+    }
+
+    #[test]
+    fn unsupported_files_syntax_fails_with_rollback_and_an_explanation() {
+        let fixture = ScriptFixture::new();
+        let original = "FILES=($(printf /keep.bin))\n";
+        fs::write(fixture.dir.join("mkinitcpio.conf"), original).unwrap();
+        let output = fixture.run(false);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("command substitutions are unsupported")
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap(),
+            original
+        );
+        assert!(!fixture.firmware().exists());
+    }
+
+    #[test]
+    fn uninstall_removes_only_exact_firmware_entries_from_multiline_files() {
+        let fixture = ScriptFixture::new();
+        let path = fixture.firmware().display().to_string();
+        fs::write(fixture.firmware(), b"old-edid").unwrap();
+        fs::write(fixture.dir.join("mkinitcpio.conf"), format!("# Keep this comment: {path}\nFILES=(\n  \"{path}\"\n  '{path}.other'\n  /keep.bin\n)\nOTHER='{path}'\n")).unwrap();
+        let output = fixture.run(true);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap();
+        assert!(!config.contains(&format!("\"{path}\"")), "{config}");
+        assert!(config.contains(&format!("'{path}.other'")), "{config}");
+        assert!(config.contains(&format!("OTHER='{path}'")));
+        assert!(config.contains(&format!("# Keep this comment: {path}")));
+    }
+
     #[test]
     fn system_support_accepts_limine_mkinitcpio_stack() {
         let dir = unique_test_dir();
@@ -1370,8 +1620,8 @@ mod tests {
     #[test]
     fn script_is_idempotent() {
         let script = build_install_script(&sample_plan());
-        // The script checks mkinitcpio and de-duplicates connector mappings.
-        assert!(script.contains("grep -qF"));
+        // Repeated installs retain one FILES entry and de-duplicate mappings.
+        assert!(script.contains("operation=add"));
         assert!(script.contains("if (!seen[mapping]++)"));
         assert!(script.contains("index(mapping, connector \":\") == 1"));
     }
