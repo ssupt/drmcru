@@ -711,6 +711,8 @@ fn repair_block_checksum(block: &mut [u8]) {
 
 /// Remove stereoscopic DTD flags from a desktop EDID override. Preserve sync,
 /// interlace, monitor descriptors, data blocks, and unsupported extensions.
+/// Bit 0 is only part of the stereo encoding when bits 6:5 are set; on its own
+/// it is a don't-care bit and is left untouched.
 pub fn clear_detailed_timing_stereo(raw: &mut [u8]) -> usize {
     if raw.len() < BASE_BLOCK_LEN || raw[..8] != HEADER {
         return 0;
@@ -733,7 +735,7 @@ pub fn clear_detailed_timing_stereo(raw: &mut [u8]) -> usize {
         };
         let mut changed = false;
         for descriptor in block[range].chunks_exact_mut(DTD_LEN) {
-            if (descriptor[0] != 0 || descriptor[1] != 0) && descriptor[17] & 0x61 != 0 {
+            if (descriptor[0] != 0 || descriptor[1] != 0) && descriptor[17] & 0x60 != 0 {
                 descriptor[17] &= !0x61;
                 cleared += 1;
                 changed = true;
@@ -1468,7 +1470,7 @@ mod tests {
 
     #[test]
     fn clears_all_stereo_encodings_without_changing_other_dtd_fields() {
-        for stereo in [0x01, 0x20, 0x21, 0x40, 0x41, 0x60, 0x61] {
+        for stereo in [0x20, 0x21, 0x40, 0x41, 0x60, 0x61] {
             let mut raw = minimal_base_edid(1);
             let mut descriptor = encode_detailed_timing(&sample_timing()).unwrap();
             descriptor[17] = 0x9e | stereo;
@@ -1497,6 +1499,18 @@ mod tests {
             assert!(raw.chunks_exact(128).all(block_checksum_valid));
             assert_eq!(clear_detailed_timing_stereo(&mut raw), 0);
         }
+    }
+
+    #[test]
+    fn leaves_dont_care_bit_zero_alone_without_stereo_bits() {
+        let mut raw = minimal_base_edid(0);
+        let mut descriptor = encode_detailed_timing(&sample_timing()).unwrap();
+        descriptor[17] = 0x19;
+        raw[54..72].copy_from_slice(&descriptor);
+        repair_block_checksum(&mut raw);
+        let before = raw.clone();
+        assert_eq!(clear_detailed_timing_stereo(&mut raw), 0);
+        assert_eq!(raw, before);
     }
 
     #[test]

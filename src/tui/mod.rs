@@ -831,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_export_checks_unknown_extension_checksums_and_length() {
+    fn export_checks_unknown_extension_checksums_and_length() {
         for truncate in [false, true] {
             let mut monitor = monitor_with_cta_dtd();
             let mut raw = monitor.edid.take().unwrap().raw;
@@ -844,6 +844,10 @@ mod tests {
             }
             monitor.edid = Some(parse_edid(raw).unwrap());
             let mut app = App::new(vec![monitor]);
+            app.selected_workspace_mut()
+                .unwrap()
+                .add_dtd(timing())
+                .unwrap();
             app.export_selected_monitor();
             assert!(
                 app.details_dialog
@@ -855,29 +859,15 @@ mod tests {
     }
 
     #[test]
-    fn draft_export_can_append_a_cta_when_existing_slots_are_full() {
-        let mut monitor = monitor_with_cta_dtd();
-        let mut raw = monitor.edid.take().unwrap().raw;
-        for slot in 0..4 {
-            raw = crate::edid::patch_detailed_timing(&raw, DtdLocation::Base { slot }, &timing())
-                .unwrap();
-        }
-        for slot in 0..6 {
-            raw = crate::edid::patch_detailed_timing(
-                &raw,
-                DtdLocation::Cta {
-                    extension_index: 1,
-                    slot,
-                },
-                &timing(),
-            )
-            .unwrap();
-        }
-        monitor.edid = Some(parse_edid(raw).unwrap());
-        let mut app = App::new(vec![monitor]);
+    fn export_refuses_unchanged_workspace() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+
         app.export_selected_monitor();
-        assert!(app.export_confirm_dialog.is_some());
+
+        assert!(app.export_confirm_dialog.is_none());
+        assert!(app.export_dialog.is_none());
         assert!(app.details_dialog.is_none());
+        assert!(app.status.contains("No workspace changes"));
     }
 
     #[test]
@@ -983,21 +973,5 @@ mod tests {
             actions::normalize_import_path("'/tmp/display file.bin'", Some(&home)),
             PathBuf::from("/tmp/display file.bin")
         );
-    }
-
-    #[test]
-    fn export_validation_errors_cannot_be_bypassed() {
-        let mut app = App::new(vec![monitor_with_cta_dtd()]);
-        app.draft_timing.pixel_clock_khz = 0;
-
-        app.export_selected_monitor();
-
-        assert!(app.export_confirm_dialog.is_none());
-        assert!(
-            app.details_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.title == "Export Blocked")
-        );
-        assert!(app.status.contains("blocked"));
     }
 }

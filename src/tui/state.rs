@@ -4,7 +4,6 @@ use crate::export::ExportResult;
 use crate::models::{StandardTiming, StandardTimingAspect, TimingDescriptor};
 use crate::timings::{CvtRequest, TimingPreset, timing_for_preset};
 use crate::validation::validate_timing;
-use crate::workspace::format_location;
 use ratatui::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,10 +178,7 @@ impl ExportDialog {
         Self {
             path: result.path.display().to_string(),
             instructions_path: result.instructions_path.display().to_string(),
-            location: result
-                .insert_location
-                .map(format_location)
-                .unwrap_or_else(|| "workspace EDID".to_string()),
+            location: "workspace EDID".to_string(),
             kernel_parameter: result.plan.drm_kernel_parameter(),
             hyprland_rule: result.plan.hyprland_monitor_rule(),
         }
