@@ -34,15 +34,15 @@ yay -S drmcru-bin
 ```
 
 Download the portable x86-64 binary from the
-[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.4):
+[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.5):
 
 ```sh
-curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.4/drmcru-0.1.4-x86_64-unknown-linux-musl
-curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.4/SHA256SUMS
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.5/drmcru-0.1.5-x86_64-unknown-linux-musl
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.5/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-chmod +x drmcru-0.1.4-x86_64-unknown-linux-musl
-./drmcru-0.1.4-x86_64-unknown-linux-musl doctor
-./drmcru-0.1.4-x86_64-unknown-linux-musl
+chmod +x drmcru-0.1.5-x86_64-unknown-linux-musl
+./drmcru-0.1.5-x86_64-unknown-linux-musl doctor
+./drmcru-0.1.5-x86_64-unknown-linux-musl
 ```
 
 The TUI and manual Export work on Linux systems that expose connectors through
