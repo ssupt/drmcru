@@ -543,6 +543,21 @@ mod tests {
     }
 
     #[test]
+    fn non_stereo_bit_zero_is_not_a_pending_override() {
+        for flags in [0x19, 0x1b] {
+            let mut raw =
+                patch_base_detailed_timing(&minimal_base_edid(0), 0, &sample_timing()).unwrap();
+            raw[71] = flags;
+            repair_checksum(&mut raw);
+            let workspace = EdidWorkspace::new(raw.clone()).unwrap();
+
+            assert!(!workspace.has_changes());
+            assert_eq!(workspace.export_bytes(), raw);
+            assert_eq!(workspace.diff_summary(), vec!["No EDID byte changes."]);
+        }
+    }
+
+    #[test]
     fn range_changes_export_with_a_valid_checksum_and_can_be_reset() {
         let mut raw = minimal_base_edid(0);
         raw[18] = 1;

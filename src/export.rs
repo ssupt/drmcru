@@ -317,6 +317,64 @@ mod tests {
     }
 
     #[test]
+    fn vrr_export_preserves_non_stereo_timing_flags_and_extension_bytes() {
+        let mut monitor = crate::demo::monitors().unwrap().remove(0);
+        let mut raw = monitor.edid.as_ref().unwrap().raw.clone();
+        for (offset, flags) in [(71, 0x19), (89, 0x1b), (154, 0x1b), (172, 0x19)] {
+            raw[offset] = flags;
+        }
+        for block in raw.chunks_exact_mut(128) {
+            block[127] = 0u8.wrapping_sub(
+                block[..127]
+                    .iter()
+                    .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+            );
+        }
+        monitor.edid = Some(crate::edid::parse_edid(raw.clone()).unwrap());
+        let mut workspace = EdidWorkspace::new(raw.clone()).unwrap();
+        assert!(!workspace.has_changes());
+        workspace
+            .set_vrr_range(crate::edid::VrrRange {
+                min_hz: 40,
+                max_hz: 144,
+            })
+            .unwrap();
+        assert!(
+            workspace
+                .diff_summary()
+                .iter()
+                .all(|line| !line.contains("stereo"))
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "drmcru-vrr-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let result =
+            export_workspace_edid(&monitor, &workspace, "2560x1440@144", &directory).unwrap();
+        let exported = fs::read(result.path).unwrap();
+        let mut expected = raw;
+        expected[95] = 40;
+        expected[127] = 0u8.wrapping_sub(
+            expected[..127]
+                .iter()
+                .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        );
+
+        assert_eq!(exported, expected);
+        assert!(
+            exported
+                .chunks_exact(128)
+                .all(crate::edid::block_checksum_valid)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn instructions_shell_quote_generated_path() {
         let plan = build_export_plan_with_file("DP-1", "custom.bin", sample_timing());
         let instructions = export_instructions(Path::new("/tmp/user's exports/custom.bin"), &plan);
