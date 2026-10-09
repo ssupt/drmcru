@@ -831,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_export_checks_unknown_extension_checksums_and_length() {
+    fn workspace_export_checks_unknown_extension_checksums_and_length() {
         for truncate in [false, true] {
             let mut monitor = monitor_with_cta_dtd();
             let mut raw = monitor.edid.take().unwrap().raw;
@@ -844,6 +844,10 @@ mod tests {
             }
             monitor.edid = Some(parse_edid(raw).unwrap());
             let mut app = App::new(vec![monitor]);
+            app.selected_workspace_mut()
+                .unwrap()
+                .add_dtd(timing())
+                .unwrap();
             app.export_selected_monitor();
             assert!(
                 app.details_dialog
@@ -855,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_export_can_append_a_cta_when_existing_slots_are_full() {
+    fn adding_a_timing_explicitly_can_append_a_cta_when_existing_slots_are_full() {
         let mut monitor = monitor_with_cta_dtd();
         let mut raw = monitor.edid.take().unwrap().raw;
         for slot in 0..4 {
@@ -875,9 +879,70 @@ mod tests {
         }
         monitor.edid = Some(parse_edid(raw).unwrap());
         let mut app = App::new(vec![monitor]);
+        app.open_detailed_editor(state::EditorMode::Add);
+        app.apply_detailed_editor();
+
+        assert!(app.detailed_editor.is_none());
+        let workspace = app.selected_workspace().unwrap();
+        assert!(workspace.has_changes());
+        assert_eq!(workspace.parsed().raw.len(), 384);
+        assert!(workspace.validate().is_empty());
+    }
+
+    #[test]
+    fn export_without_a_monitor_or_edid_has_an_actionable_error() {
+        let mut app = App::new(Vec::new());
         app.export_selected_monitor();
+        assert_eq!(app.status, "No monitor selected.");
+
+        let mut monitor = monitor_with_cta_dtd();
+        monitor.edid = None;
+        let mut app = App::new(vec![monitor]);
+        app.export_selected_monitor();
+        assert_eq!(
+            app.status,
+            "Selected monitor has no readable EDID to export."
+        );
+        assert!(app.export_confirm_dialog.is_none());
+        assert!(app.export_dialog.is_none());
+    }
+
+    #[test]
+    fn export_refuses_unchanged_non_stereo_workspace() {
+        for flags in [0x1a, 0x19, 0x1b] {
+            let mut monitor = monitor_with_cta_dtd();
+            let mut raw = monitor.edid.take().unwrap().raw;
+            raw[151] = flags;
+            repair_checksum(&mut raw[128..]);
+            monitor.edid = Some(parse_edid(raw.clone()).unwrap());
+            let mut app = App::new(vec![monitor]);
+
+            app.export_selected_monitor();
+
+            assert!(app.export_confirm_dialog.is_none());
+            assert!(app.export_dialog.is_none());
+            assert!(app.details_dialog.is_none());
+            assert!(app.status.contains("No workspace changes"));
+            assert_eq!(app.selected_workspace().unwrap().export_bytes(), raw);
+        }
+    }
+
+    #[test]
+    fn stereo_only_export_uses_workspace_validation_instead_of_the_draft() {
+        let mut monitor = monitor_with_cta_dtd();
+        let mut raw = monitor.edid.take().unwrap().raw;
+        raw[151] |= 0xe1;
+        repair_checksum(&mut raw[128..]);
+        monitor.edid = Some(parse_edid(raw.clone()).unwrap());
+        let mut app = App::new(vec![monitor]);
+        app.draft_timing.pixel_clock_khz = 0;
+
+        app.export_selected_monitor();
+
+        assert!(app.selected_workspace().unwrap().has_changes());
         assert!(app.export_confirm_dialog.is_some());
         assert!(app.details_dialog.is_none());
+        assert_eq!(app.selected_workspace().unwrap().parsed().raw, raw);
     }
 
     #[test]
@@ -986,9 +1051,14 @@ mod tests {
     }
 
     #[test]
-    fn export_validation_errors_cannot_be_bypassed() {
+    fn workspace_export_validation_errors_cannot_be_bypassed() {
         let mut app = App::new(vec![monitor_with_cta_dtd()]);
-        app.draft_timing.pixel_clock_khz = 0;
+        let mut invalid_timing = timing();
+        invalid_timing.h_blanking = 16;
+        app.selected_workspace_mut()
+            .unwrap()
+            .add_dtd(invalid_timing)
+            .unwrap();
 
         app.export_selected_monitor();
 

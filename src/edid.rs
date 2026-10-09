@@ -711,6 +711,7 @@ fn repair_block_checksum(block: &mut [u8]) {
 
 /// Remove stereoscopic DTD flags from a desktop EDID override. Preserve sync,
 /// interlace, monitor descriptors, data blocks, and unsupported extensions.
+/// Bit 0 only selects a stereo format when bits 6:5 are nonzero.
 pub fn clear_detailed_timing_stereo(raw: &mut [u8]) -> usize {
     if raw.len() < BASE_BLOCK_LEN || raw[..8] != HEADER {
         return 0;
@@ -733,7 +734,7 @@ pub fn clear_detailed_timing_stereo(raw: &mut [u8]) -> usize {
         };
         let mut changed = false;
         for descriptor in block[range].chunks_exact_mut(DTD_LEN) {
-            if (descriptor[0] != 0 || descriptor[1] != 0) && descriptor[17] & 0x61 != 0 {
+            if (descriptor[0] != 0 || descriptor[1] != 0) && descriptor[17] & 0x60 != 0 {
                 descriptor[17] &= !0x61;
                 cleared += 1;
                 changed = true;
@@ -1468,7 +1469,7 @@ mod tests {
 
     #[test]
     fn clears_all_stereo_encodings_without_changing_other_dtd_fields() {
-        for stereo in [0x01, 0x20, 0x21, 0x40, 0x41, 0x60, 0x61] {
+        for stereo in [0x20, 0x21, 0x40, 0x41, 0x60, 0x61] {
             let mut raw = minimal_base_edid(1);
             let mut descriptor = encode_detailed_timing(&sample_timing()).unwrap();
             descriptor[17] = 0x9e | stereo;
@@ -1497,6 +1498,53 @@ mod tests {
             assert!(raw.chunks_exact(128).all(block_checksum_valid));
             assert_eq!(clear_detailed_timing_stereo(&mut raw), 0);
         }
+    }
+
+    #[test]
+    fn non_stereo_dtd_flags_and_checksums_are_preserved() {
+        let mut raw = minimal_base_edid(1);
+        for (slot, flags) in [0x19, 0x1b].into_iter().enumerate() {
+            let mut descriptor = encode_detailed_timing(&sample_timing()).unwrap();
+            descriptor[17] = flags;
+            let offset = DTD_START + slot * DTD_LEN;
+            raw[offset..offset + DTD_LEN].copy_from_slice(&descriptor);
+        }
+        repair_block_checksum(&mut raw);
+        let mut cta = vec![0; EDID_BLOCK_LEN];
+        cta[0] = CTA_TAG;
+        cta[1] = 3;
+        cta[2] = 4;
+        for (slot, flags) in [0x19, 0x1b].into_iter().enumerate() {
+            let mut descriptor = encode_detailed_timing(&sample_timing()).unwrap();
+            descriptor[17] = flags;
+            let offset = 4 + slot * DTD_LEN;
+            cta[offset..offset + DTD_LEN].copy_from_slice(&descriptor);
+        }
+        repair_block_checksum(&mut cta);
+        raw.extend_from_slice(&cta);
+        let before = raw.clone();
+
+        assert_eq!(clear_detailed_timing_stereo(&mut raw), 0);
+        assert_eq!(raw, before);
+        assert!(raw.chunks_exact(EDID_BLOCK_LEN).all(block_checksum_valid));
+    }
+
+    #[test]
+    fn stereo_cleanup_preserves_adjacent_non_stereo_dtds() {
+        let mut raw = minimal_base_edid(0);
+        for (slot, flags) in [0x19, 0x7b, 0x1b].into_iter().enumerate() {
+            let mut descriptor = encode_detailed_timing(&sample_timing()).unwrap();
+            descriptor[17] = flags;
+            let offset = DTD_START + slot * DTD_LEN;
+            raw[offset..offset + DTD_LEN].copy_from_slice(&descriptor);
+        }
+        repair_block_checksum(&mut raw);
+        let mut expected = raw.clone();
+        expected[DTD_START + DTD_LEN + 17] = 0x1a;
+        repair_block_checksum(&mut expected);
+
+        assert_eq!(clear_detailed_timing_stereo(&mut raw), 1);
+        assert_eq!(raw, expected);
     }
 
     #[test]

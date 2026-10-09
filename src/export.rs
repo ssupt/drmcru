@@ -1,72 +1,22 @@
-use crate::edid::{DtdLocation, EdidError, insert_detailed_timing};
 use crate::hyprland_config;
-use crate::models::{ExportPlan, Monitor, TimingDescriptor};
+use crate::models::{ExportPlan, Monitor};
 use crate::workspace::EdidWorkspace;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub fn build_export_plan_with_file(
-    connector: impl Into<String>,
-    edid_file_name: impl Into<String>,
-    timing: TimingDescriptor,
-) -> ExportPlan {
-    let connector = connector.into();
-    let hyprland_mode = timing.hyprland_mode();
-    ExportPlan {
-        hyprland_rule: format!("monitor={connector},{hyprland_mode},auto,1"),
-        connector,
-        edid_file_name: edid_file_name.into(),
-        hyprland_mode,
-        position: "auto".to_string(),
-        scale: "1".to_string(),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportResult {
     pub path: PathBuf,
     pub instructions_path: PathBuf,
     pub plan: ExportPlan,
-    pub insert_location: Option<DtdLocation>,
 }
 
 #[derive(Debug, Error)]
 pub enum ExportError {
-    #[error("selected monitor has no readable EDID")]
-    MissingEdid,
-    #[error("failed to patch EDID: {0}")]
-    Edid(#[from] EdidError),
     #[error("failed to write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
-}
-
-pub fn export_patched_edid(
-    monitor: &Monitor,
-    timing: &TimingDescriptor,
-    output_dir: &Path,
-) -> Result<ExportResult, ExportError> {
-    let edid = monitor.edid.as_ref().ok_or(ExportError::MissingEdid)?;
-    let (mut patched, insert_location) = insert_detailed_timing(&edid.raw, timing)?;
-    crate::edid::clear_detailed_timing_stereo(&mut patched);
-    let file_name = custom_edid_file_name(&monitor.connector);
-    let path = output_dir.join(&file_name);
-    let instructions_path = output_dir.join(instructions_file_name(&monitor.connector));
-    let plan = build_export_plan_for_monitor(monitor, file_name, timing.clone());
-
-    fs::write(&path, patched).map_err(|source| ExportError::Write {
-        path: path.clone(),
-        source,
-    })?;
-    write_instructions(&instructions_path, &path, &plan)?;
-
-    Ok(ExportResult {
-        path,
-        instructions_path,
-        plan,
-        insert_location: Some(insert_location),
-    })
 }
 
 pub fn export_workspace_edid(
@@ -91,7 +41,6 @@ pub fn export_workspace_edid(
         path,
         instructions_path,
         plan,
-        insert_location: None,
     })
 }
 
@@ -131,23 +80,6 @@ fn shell_quote(value: &str) -> String {
 
 pub fn custom_edid_file_name(connector: &str) -> String {
     format!("drmcru_custom_{}.bin", file_safe_connector(connector))
-}
-
-fn build_export_plan_for_monitor(
-    monitor: &Monitor,
-    edid_file_name: impl Into<String>,
-    timing: TimingDescriptor,
-) -> ExportPlan {
-    let mut plan = build_export_plan_with_file(&monitor.connector, edid_file_name, timing);
-    plan.position = monitor_position(monitor);
-    plan.scale = monitor_scale(monitor);
-    plan.hyprland_rule = hyprland_config::format_monitor_rule(
-        &plan.connector,
-        &plan.hyprland_mode,
-        &plan.position,
-        &plan.scale,
-    );
-    plan
 }
 
 fn build_export_plan_for_monitor_mode(
@@ -238,7 +170,24 @@ fn write_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ConnectorStatus, HyprlandMonitor};
+    use crate::models::{ConnectorStatus, HyprlandMonitor, TimingDescriptor};
+
+    fn build_export_plan_with_file(
+        connector: impl Into<String>,
+        edid_file_name: impl Into<String>,
+        timing: TimingDescriptor,
+    ) -> ExportPlan {
+        let connector = connector.into();
+        let hyprland_mode = timing.hyprland_mode();
+        ExportPlan {
+            hyprland_rule: format!("monitor={connector},{hyprland_mode},auto,1"),
+            connector,
+            edid_file_name: edid_file_name.into(),
+            hyprland_mode,
+            position: "auto".to_string(),
+            scale: "1".to_string(),
+        }
+    }
 
     fn sample_timing() -> TimingDescriptor {
         TimingDescriptor {
@@ -272,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn both_export_paths_clear_existing_stereo_flags() {
+    fn workspace_export_clears_stereo_without_inserting_draft_timings() {
         let monitor = crate::demo::monitors().unwrap().remove(0);
         let mut monitor = monitor;
         let mut raw = monitor.edid.as_ref().unwrap().raw.clone();
@@ -296,23 +245,81 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&directory).unwrap();
-        let workspace = EdidWorkspace::new(raw).unwrap();
-        for workspace_export in [true, false] {
-            let result = if workspace_export {
-                export_workspace_edid(&monitor, &workspace, "2560x1440@144", &directory)
-            } else {
-                export_patched_edid(&monitor, &sample_timing(), &directory)
-            };
-            let result = result.unwrap();
-            let bytes = fs::read(result.path).unwrap();
-            assert_eq!(bytes[71] & 0x61, 0);
-            assert_eq!(bytes[154] & 0x61, 0);
-            assert!(
-                bytes
-                    .chunks_exact(128)
-                    .all(crate::edid::block_checksum_valid)
+        let workspace = EdidWorkspace::new(raw.clone()).unwrap();
+        let result =
+            export_workspace_edid(&monitor, &workspace, "2560x1440@144", &directory).unwrap();
+        let bytes = fs::read(result.path).unwrap();
+        assert_eq!(bytes.len(), raw.len());
+        assert_eq!(bytes[71] & 0x61, 0);
+        assert_eq!(bytes[154] & 0x61, 0);
+        for offset in 0..bytes.len() {
+            if ![71, 127, 154, 255].contains(&offset) {
+                assert_eq!(bytes[offset], raw[offset]);
+            }
+        }
+        assert!(
+            bytes
+                .chunks_exact(128)
+                .all(crate::edid::block_checksum_valid)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn vrr_export_preserves_non_stereo_timing_flags_and_extension_bytes() {
+        let mut monitor = crate::demo::monitors().unwrap().remove(0);
+        let mut raw = monitor.edid.as_ref().unwrap().raw.clone();
+        for (offset, flags) in [(71, 0x19), (89, 0x1b), (154, 0x1b), (172, 0x19)] {
+            raw[offset] = flags;
+        }
+        for block in raw.chunks_exact_mut(128) {
+            block[127] = 0u8.wrapping_sub(
+                block[..127]
+                    .iter()
+                    .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
             );
         }
+        monitor.edid = Some(crate::edid::parse_edid(raw.clone()).unwrap());
+        let mut workspace = EdidWorkspace::new(raw.clone()).unwrap();
+        assert!(!workspace.has_changes());
+        workspace
+            .set_vrr_range(crate::edid::VrrRange {
+                min_hz: 40,
+                max_hz: 144,
+            })
+            .unwrap();
+        assert!(
+            workspace
+                .diff_summary()
+                .iter()
+                .all(|line| !line.contains("stereo"))
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "drmcru-vrr-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let result =
+            export_workspace_edid(&monitor, &workspace, "2560x1440@144", &directory).unwrap();
+        let exported = fs::read(result.path).unwrap();
+        let mut expected = raw;
+        expected[95] = 40;
+        expected[127] = 0u8.wrapping_sub(
+            expected[..127]
+                .iter()
+                .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        );
+
+        assert_eq!(exported, expected);
+        assert!(
+            exported
+                .chunks_exact(128)
+                .all(crate::edid::block_checksum_valid)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -349,8 +356,11 @@ mod tests {
             edid: None,
         };
 
-        let plan =
-            build_export_plan_for_monitor(&monitor, "drmcru_custom_DP-1.bin", sample_timing());
+        let plan = build_export_plan_for_monitor_mode(
+            &monitor,
+            "drmcru_custom_DP-1.bin",
+            &sample_timing().hyprland_mode(),
+        );
 
         let rule = plan.hyprland_monitor_rule();
         if rule.starts_with("monitor=") {

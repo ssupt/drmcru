@@ -7,7 +7,7 @@ use super::{
     App, ExtensionRow, FocusArea, ModeKey, ModeProvenance, PendingSystemAction, SystemExecution,
 };
 use crate::edid::DtdLocation;
-use crate::export::{custom_edid_file_name, export_patched_edid, export_workspace_edid};
+use crate::export::{custom_edid_file_name, export_workspace_edid};
 use crate::hyprland::{self, ModeRequest};
 use crate::hyprland_config::{self, MonitorRuleInspection};
 use crate::install::{self, InstallPlan, InstallPreview, UninstallPlan, UninstallPreview};
@@ -971,7 +971,22 @@ impl App {
     }
 
     pub(super) fn export_selected_monitor(&mut self) {
-        let issues = self.export_validation_issues();
+        if self.selected_monitor().is_none() {
+            self.status = "No monitor selected.".to_string();
+            return;
+        }
+        let Some(workspace) = self.selected_workspace() else {
+            self.status = "Selected monitor has no readable EDID to export.".to_string();
+            return;
+        };
+        if !workspace.has_changes() {
+            self.status =
+                "No workspace changes are pending. Add, edit, delete, or import a timing first."
+                    .to_string();
+            return;
+        }
+
+        let issues = self.workspace_validation_issues(workspace);
         let blocking = issues
             .iter()
             .filter(|issue| issue.starts_with("Error:"))
@@ -1021,18 +1036,21 @@ impl App {
             return;
         };
 
-        let result = match self.selected_workspace() {
-            Some(workspace) if workspace.has_changes() => {
-                let Some(mode) = self.workspace_target_mode() else {
-                    self.status =
-                        "Export needs at least one resolution to generate a Hyprland rule."
-                            .to_string();
-                    return;
-                };
-                export_workspace_edid(monitor, workspace, &mode, &output_dir)
-            }
-            _ => export_patched_edid(monitor, &self.draft_timing, &output_dir),
+        let Some(workspace) = self
+            .selected_workspace()
+            .filter(|workspace| workspace.has_changes())
+        else {
+            self.status =
+                "No workspace changes are pending. Add, edit, delete, or import a timing first."
+                    .to_string();
+            return;
         };
+        let Some(mode) = self.workspace_target_mode() else {
+            self.status =
+                "Export needs at least one resolution to generate a Hyprland rule.".to_string();
+            return;
+        };
+        let result = export_workspace_edid(monitor, workspace, &mode, &output_dir);
 
         match result {
             Ok(result) => {
@@ -1052,67 +1070,6 @@ impl App {
                 self.status = format!("Export failed: {error}");
             }
         }
-    }
-
-    fn export_validation_issues(&self) -> Vec<String> {
-        let mut issues = Vec::new();
-        let Some(monitor) = self.selected_monitor() else {
-            issues.push("Error: No monitor is selected.".to_string());
-            return issues;
-        };
-
-        let exporting_workspace = self
-            .selected_workspace()
-            .map(EdidWorkspace::has_changes)
-            .unwrap_or(false);
-
-        if exporting_workspace {
-            if let Some(workspace) = self.selected_workspace() {
-                issues.extend(self.workspace_validation_issues(workspace));
-            }
-        } else {
-            let Some(edid) = monitor.edid.as_ref() else {
-                issues.push("Error: Selected monitor has no readable EDID to patch.".to_string());
-                return issues;
-            };
-
-            if let Ok(mut workspace) = EdidWorkspace::from_edid(edid) {
-                issues.extend(self.workspace_validation_issues(&workspace));
-                if let Err(error) = workspace.add_dtd(self.draft_timing.clone()) {
-                    issues.push(format!("Error: Cannot insert draft timing: {error}"));
-                }
-            }
-            issues.push(
-                "Warning: No workspace EDID changes are pending; export will insert the current draft detailed timing."
-                    .to_string(),
-            );
-        }
-
-        if !exporting_workspace {
-            issues.extend(
-                validate_timing(&self.draft_timing)
-                    .into_iter()
-                    .map(|warning| {
-                        format!("{}: Draft timing: {}", warning.label(), warning.message)
-                    }),
-            );
-            if let Some(warning) = self.internal_panel_timing_warning() {
-                issues.push(format!("Warning: Internal panel: {}", warning.message));
-            }
-
-            if let Some(key) = ModeKey::from_timing(&self.draft_timing) {
-                let provenance = self.mode_provenance(key);
-                if provenance.sources.len() > 1 {
-                    issues.push(format!(
-                        "Warning: Draft timing duplicates an existing mode in {} source(s): {}.",
-                        provenance.sources.len(),
-                        provenance.sources.join(", ")
-                    ));
-                }
-            }
-        }
-
-        issues
     }
 
     fn workspace_validation_issues(&self, workspace: &EdidWorkspace) -> Vec<String> {
