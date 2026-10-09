@@ -94,6 +94,10 @@ reading or changing a real monitor.
 `Switch` only selects modes already exposed by DRM/Hyprland. It does not make a
 new EDID mode appear.
 
+Export writes the current working EDID. With no pending changes, it asks you to
+make an edit before writing any files. VRR edits and stereo cleanup also count
+as pending changes.
+
 ## What It Can Edit
 
 - Established timing inspection
