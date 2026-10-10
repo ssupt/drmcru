@@ -8,8 +8,14 @@ function fail(message) {
 
 function finish_token(    keep) {
     keep = !(operation == "remove" && !dynamic && value == path)
-    if (!dynamic && value == path)
+    if (!dynamic && value == path) {
         found = 1
+        if (append && operation == "add") {
+            if (found_in_dropin)
+                keep = 0
+            found_in_dropin = 1
+        }
+    }
     if (keep)
         result = result token
     token = value = ""
@@ -24,6 +30,8 @@ function finish_token(    keep) {
         saw_array = 1
         found = 0
         result = substr($0, 1, RLENGTH)
+        if (append)
+            sub(/FILES=/, "FILES+=", result)
         start = RLENGTH + 1
     }
     for (i = start; i <= length($0); i++) {
@@ -60,7 +68,7 @@ function finish_token(    keep) {
         } else if (character ~ /[[:space:]]/ || character == ")") {
             finish_token()
             if (character == ")") {
-                if (operation == "add" && !found)
+                if (operation == "add" && !append && !found)
                     result = result " \"" path "\""
                 in_files = 0
             }
@@ -85,6 +93,6 @@ END {
         exit 1
     if (in_files)
         fail("unterminated FILES array")
-    if (operation == "add" && !saw_array)
-        print "FILES=(\"" path "\")"
+    if (operation == "add" && ((append && !found_in_dropin) || (!append && !saw_array)))
+        print "FILES" (append ? "+" : "") "=(\"" path "\")"
 }
