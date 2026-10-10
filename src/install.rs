@@ -6,6 +6,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+const MKINITCPIO_DROPIN: &str = "/etc/mkinitcpio.conf.d/20-drmcru.conf";
+
 /// Describes everything needed to install a custom EDID into the system.
 #[derive(Debug, Clone)]
 pub struct InstallPlan {
@@ -48,7 +50,7 @@ pub struct InstallPreview {
     pub connector: String,
     pub edid_source: String,
     pub firmware_target: String,
-    pub mkinitcpio_conf: String,
+    pub mkinitcpio_dropin: String,
     pub bootloader_conf: String,
     pub limine_entry_tool_dropin: String,
     pub kernel_parameter: String,
@@ -58,7 +60,7 @@ pub struct InstallPreview {
 pub struct UninstallPreview {
     pub connector: String,
     pub firmware_target: String,
-    pub mkinitcpio_conf: String,
+    pub mkinitcpio_dropin: String,
     pub bootloader_conf: String,
     pub limine_entry_tool_dropin: String,
     pub kernel_parameter: String,
@@ -271,7 +273,7 @@ impl UninstallPreview {
         Self {
             connector: plan.connector.clone(),
             firmware_target: plan.firmware_target().display().to_string(),
-            mkinitcpio_conf: "/etc/mkinitcpio.conf".to_string(),
+            mkinitcpio_dropin: MKINITCPIO_DROPIN.to_string(),
             bootloader_conf: "/boot/limine.conf".to_string(),
             limine_entry_tool_dropin: "/etc/limine-entry-tool.d/drmcru-edid.conf".to_string(),
             kernel_parameter: plan.kernel_parameter.clone(),
@@ -284,8 +286,9 @@ impl UninstallPreview {
             format!("Remove:     {}", self.firmware_target),
             format!(
                 "Patch:      {} (remove EDID from FILES)",
-                self.mkinitcpio_conf
+                self.mkinitcpio_dropin
             ),
+            "Clean:      /etc/mkinitcpio.conf (remove any legacy EDID entry)".to_string(),
             format!(
                 "Patch:      {} (remove kernel param from cmdline entries)",
                 self.bootloader_conf
@@ -306,7 +309,7 @@ impl InstallPreview {
             connector: plan.connector.clone(),
             edid_source: plan.edid_source.display().to_string(),
             firmware_target: plan.firmware_target().display().to_string(),
-            mkinitcpio_conf: "/etc/mkinitcpio.conf".to_string(),
+            mkinitcpio_dropin: MKINITCPIO_DROPIN.to_string(),
             bootloader_conf: "/boot/limine.conf".to_string(),
             limine_entry_tool_dropin: "/etc/limine-entry-tool.d/drmcru-edid.conf".to_string(),
             kernel_parameter: plan.kernel_parameter.clone(),
@@ -320,7 +323,11 @@ impl InstallPreview {
                 "Copy EDID:  {} → {}",
                 self.edid_source, self.firmware_target
             ),
-            format!("Patch:      {} (add EDID to FILES)", self.mkinitcpio_conf),
+            format!(
+                "Patch:      {} (append EDID to FILES)",
+                self.mkinitcpio_dropin
+            ),
+            "Migrate:    /etc/mkinitcpio.conf (remove any legacy EDID entry)".to_string(),
             format!(
                 "Patch:      {} (add kernel param to cmdline entries)",
                 self.bootloader_conf
@@ -384,6 +391,9 @@ fn inspect_system_support_with_paths(
     let mkinitcpio_conf_present =
         path_exists(mkinitcpio_conf, "mkinitcpio config", &mut read_warnings);
     let mkinitcpio_presets_present = has_mkinitcpio_presets(mkinitcpio_dir, &mut read_warnings);
+    if !limine_mkinitcpio_available && mkinitcpio_presets_present {
+        inspect_preset_dropin_support(mkinitcpio_dir, &mut read_warnings);
+    }
     let limine_conf_present = path_exists(limine_conf, "Limine config", &mut read_warnings);
     let limine_has_cmdline = if limine_conf_present {
         match fs::read_to_string(limine_conf) {
@@ -422,6 +432,7 @@ pub fn inspect_installed_override(plan: &UninstallPlan) -> InstalledOverrideStat
         OverrideInspectionPaths {
             firmware_target: &plan.firmware_target(),
             mkinitcpio_conf: Path::new("/etc/mkinitcpio.conf"),
+            mkinitcpio_dropin: Path::new(MKINITCPIO_DROPIN),
             bootloader_conf: Path::new("/boot/limine.conf"),
             limine_entry_tool_dropin: Path::new("/etc/limine-entry-tool.d/drmcru-edid.conf"),
             active_cmdline: Path::new("/proc/cmdline"),
@@ -460,6 +471,7 @@ pub fn compare_firmware_to_live_edid(
 struct OverrideInspectionPaths<'a> {
     firmware_target: &'a Path,
     mkinitcpio_conf: &'a Path,
+    mkinitcpio_dropin: &'a Path,
     bootloader_conf: &'a Path,
     limine_entry_tool_dropin: &'a Path,
     active_cmdline: &'a Path,
@@ -474,12 +486,19 @@ fn inspect_override_with_paths(
     let mut read_warnings = Vec::new();
     let firmware_present =
         path_exists(paths.firmware_target, "firmware target", &mut read_warnings);
-    let mkinitcpio_references_firmware = file_contains(
+    let legacy_mkinitcpio_reference = file_contains(
         paths.mkinitcpio_conf,
         &paths.firmware_target.display().to_string(),
         "mkinitcpio config",
         &mut read_warnings,
     );
+    let dropin_mkinitcpio_reference = file_contains(
+        paths.mkinitcpio_dropin,
+        &paths.firmware_target.display().to_string(),
+        "mkinitcpio drop-in",
+        &mut read_warnings,
+    );
+    let mkinitcpio_references_firmware = legacy_mkinitcpio_reference || dropin_mkinitcpio_reference;
     let (
         bootloader_cmdline_entries,
         bootloader_cmdline_entries_with_kernel_parameter,
@@ -628,6 +647,44 @@ fn has_mkinitcpio_presets(path: &Path, warnings: &mut Vec<String>) -> bool {
     }
 }
 
+fn inspect_preset_dropin_support(path: &Path, warnings: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return; // The preset-directory check already reports read errors.
+    };
+    for entry in entries {
+        let preset = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                warnings.push(format!("Could not inspect mkinitcpio preset: {error}"));
+                continue;
+            }
+        };
+        if preset
+            .extension()
+            .is_none_or(|extension| extension != "preset")
+        {
+            continue;
+        }
+        match Command::new("awk")
+            .arg(include_str!("mkinitcpio_preset_config.awk"))
+            .arg(&preset)
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => warnings.push(format!(
+                "Could not use mkinitcpio drop-ins with {}: {}{}",
+                preset.display(),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => warnings.push(format!(
+                "Could not check mkinitcpio preset {}: {error}",
+                preset.display()
+            )),
+        }
+    }
+}
+
 fn command_exists(command: &str) -> bool {
     let path = Path::new(command);
     if path.components().count() > 1 {
@@ -651,7 +708,9 @@ fn yes_no(value: bool) -> &'static str {
 
 /// Build the idempotent bash install script.
 pub fn build_install_script(plan: &InstallPlan) -> String {
-    let files_awk = include_str!("mkinitcpio_files.awk");
+    let files_awk = shell_quote(include_str!("mkinitcpio_files.awk"));
+    let preset_config_awk = shell_quote(include_str!("mkinitcpio_preset_config.awk"));
+    let mkinitcpio_helpers = include_str!("mkinitcpio_dropin.sh");
     let edid_source = shell_quote(&plan.edid_source.display().to_string());
     let firmware_target = shell_quote(&plan.firmware_target().display().to_string());
     let kernel_param = shell_quote(&plan.kernel_parameter);
@@ -674,6 +733,10 @@ FIRMWARE_TARGET={firmware_target}
 KERNEL_PARAM={kernel_param}
 CONNECTOR={connector}
 MKINIT="/etc/mkinitcpio.conf"
+MKINIT_DROPIN_DIR="$MKINIT.d"
+MKINIT_DROPIN="$MKINIT_DROPIN_DIR/20-drmcru.conf"
+FILES_AWK={files_awk}
+PRESET_CONFIG_AWK={preset_config_awk}
 LIMINE="/boot/limine.conf"
 LIMINE_DROPIN_DIR="/etc/limine-entry-tool.d"
 LIMINE_DROPIN="$LIMINE_DROPIN_DIR/drmcru-edid.conf"
@@ -681,6 +744,8 @@ BACKUP_SUFFIX=".drmcru.$(date +%Y%m%d-%H%M%S-%N)-$$.bak"
 declare -a BACKUP_ORIGINALS=()
 declare -a BACKUP_PATHS=()
 FIRMWARE_WAS_PRESENT=0
+MKINIT_DROPIN_WAS_PRESENT=0
+MKINIT_DROPIN_DIR_WAS_PRESENT=0
 LIMINE_DROPIN_WAS_PRESENT=0
 LIMINE_DROPIN_DIR_WAS_PRESENT=0
 
@@ -704,6 +769,12 @@ rollback() {{
     if [ "$FIRMWARE_WAS_PRESENT" -eq 0 ]; then
         rm -f -- "$FIRMWARE_TARGET" || true
     fi
+    if [ "$MKINIT_DROPIN_WAS_PRESENT" -eq 0 ]; then
+        rm -f -- "$MKINIT_DROPIN" || true
+    fi
+    if [ "$MKINIT_DROPIN_DIR_WAS_PRESENT" -eq 0 ]; then
+        rmdir -- "$MKINIT_DROPIN_DIR" 2>/dev/null || true
+    fi
     if [ "$LIMINE_DROPIN_WAS_PRESENT" -eq 0 ]; then
         rm -f -- "$LIMINE_DROPIN" || true
     fi
@@ -712,6 +783,8 @@ rollback() {{
     fi
     exit "$status"
 }}
+
+{mkinitcpio_helpers}
 
 if [ ! -f "$EDID_SOURCE" ]; then
     echo "[ERR] EDID source does not exist: $EDID_SOURCE" >&2
@@ -743,9 +816,17 @@ if ! command -v limine-mkinitcpio >/dev/null 2>&1 && ! compgen -G "/etc/mkinitcp
     exit 1
 fi
 
+check_mkinitcpio_dropins
+
 if [ -e "$FIRMWARE_TARGET" ]; then
     FIRMWARE_WAS_PRESENT=1
     backup_file "$FIRMWARE_TARGET"
+fi
+if [ -e "$MKINIT_DROPIN" ]; then
+    MKINIT_DROPIN_WAS_PRESENT=1
+fi
+if [ -d "$MKINIT_DROPIN_DIR" ]; then
+    MKINIT_DROPIN_DIR_WAS_PRESENT=1
 fi
 if [ -e "$LIMINE_DROPIN" ]; then
     LIMINE_DROPIN_WAS_PRESENT=1
@@ -759,18 +840,10 @@ trap rollback ERR
 install -D -m 0644 -- "$EDID_SOURCE" "$FIRMWARE_TARGET"
 echo "[OK] Installed EDID to $FIRMWARE_TARGET"
 
-# 2. Patch /etc/mkinitcpio.conf — add EDID to FILES if not already present
-if [ -f "$MKINIT" ]; then
-    backup_file "$MKINIT"
-    TMP="$(mktemp /tmp/drmcru-mkinitcpio.XXXXXX)"
-    awk -v path="$FIRMWARE_TARGET" -v operation=add '{files_awk}' "$MKINIT" > "$TMP"
-    cat "$TMP" > "$MKINIT"
-    rm -f "$TMP"
-    echo "[OK] Ensured EDID is in mkinitcpio FILES"
-else
-    echo "[ERR] /etc/mkinitcpio.conf not found — automatic Apply supports mkinitcpio only" >&2
-    exit 1
-fi
+# 2. Append our EDID through a dedicated drop-in and migrate legacy installs.
+update_mkinitcpio_dropin add
+remove_legacy_mkinitcpio_entry
+echo "[OK] Ensured EDID is in mkinitcpio drop-in FILES"
 
 # 3. Patch Limine entry-tool drop-in when available. limine-mkinitcpio uses this
 #    to embed the same kernel parameter into regenerated Limine entries/UKIs.
@@ -905,7 +978,9 @@ fn shell_quote(value: &str) -> String {
 
 /// Build the idempotent bash uninstall script.
 pub fn build_uninstall_script(plan: &UninstallPlan) -> String {
-    let files_awk = include_str!("mkinitcpio_files.awk");
+    let files_awk = shell_quote(include_str!("mkinitcpio_files.awk"));
+    let preset_config_awk = shell_quote(include_str!("mkinitcpio_preset_config.awk"));
+    let mkinitcpio_helpers = include_str!("mkinitcpio_dropin.sh");
     let firmware_target = shell_quote(&plan.firmware_target().display().to_string());
     let kernel_param = shell_quote(&plan.kernel_parameter);
     let connector = shell_quote(&plan.connector);
@@ -925,6 +1000,10 @@ FIRMWARE_TARGET={firmware_target}
 KERNEL_PARAM={kernel_param}
 CONNECTOR={connector}
 MKINIT="/etc/mkinitcpio.conf"
+MKINIT_DROPIN_DIR="$MKINIT.d"
+MKINIT_DROPIN="$MKINIT_DROPIN_DIR/20-drmcru.conf"
+FILES_AWK={files_awk}
+PRESET_CONFIG_AWK={preset_config_awk}
 LIMINE="/boot/limine.conf"
 LIMINE_DROPIN_DIR="/etc/limine-entry-tool.d"
 LIMINE_DROPIN="$LIMINE_DROPIN_DIR/drmcru-edid.conf"
@@ -953,6 +1032,8 @@ rollback() {{
     exit "$status"
 }}
 
+{mkinitcpio_helpers}
+
 if [ ! -f "$MKINIT" ]; then
     echo "[ERR] /etc/mkinitcpio.conf not found — automatic uninstall supports mkinitcpio only" >&2
     exit 1
@@ -978,6 +1059,8 @@ if ! command -v limine-mkinitcpio >/dev/null 2>&1 && ! compgen -G "/etc/mkinitcp
     exit 1
 fi
 
+check_mkinitcpio_dropins
+
 if [ -e "$FIRMWARE_TARGET" ]; then
     FIRMWARE_WAS_PRESENT=1
     backup_file "$FIRMWARE_TARGET"
@@ -992,22 +1075,10 @@ else
     echo "[OK] Firmware file not present (skipped)"
 fi
 
-# 2. Patch /etc/mkinitcpio.conf — remove EDID from FILES if present
-if [ -f "$MKINIT" ]; then
-    if grep -qF -- "$FIRMWARE_TARGET" "$MKINIT" 2>/dev/null; then
-        backup_file "$MKINIT"
-        TMP="$(mktemp /tmp/drmcru-mkinitcpio.XXXXXX)"
-        awk -v path="$FIRMWARE_TARGET" -v operation=remove '{files_awk}' "$MKINIT" > "$TMP"
-        cat "$TMP" > "$MKINIT"
-        rm -f "$TMP"
-        echo "[OK] Removed EDID from mkinitcpio FILES"
-    else
-        echo "[OK] EDID not present in mkinitcpio FILES (skipped)"
-    fi
-else
-    echo "[ERR] /etc/mkinitcpio.conf not found — automatic uninstall supports mkinitcpio only" >&2
-    exit 1
-fi
+# 2. Remove this connector from our drop-in and any legacy FILES entry.
+update_mkinitcpio_dropin remove
+remove_legacy_mkinitcpio_entry
+echo "[OK] Removed EDID from mkinitcpio FILES"
 
 # 3. Patch Limine entry-tool drop-in when present
 if [ -f "$LIMINE_DROPIN" ]; then
@@ -1306,11 +1377,23 @@ mod tests {
         }
 
         fn run(&self, uninstall: bool) -> std::process::Output {
+            self.run_for_connector(uninstall, "DP-1")
+        }
+
+        fn run_for_connector(&self, uninstall: bool, connector: &str) -> std::process::Output {
+            let mut plan = sample_plan();
+            plan.connector = connector.to_string();
+            plan.edid_source = self.dir.join("source.bin");
+            plan.edid_file_name = format!("drmcru_custom_{connector}.bin");
+            plan.kernel_parameter =
+                format!("drm.edid_firmware={connector}:edid/{}", plan.edid_file_name);
             let script = if uninstall {
-                build_uninstall_script(&sample_uninstall_plan())
+                build_uninstall_script(&UninstallPlan {
+                    connector: plan.connector,
+                    edid_file_name: plan.edid_file_name,
+                    kernel_parameter: plan.kernel_parameter,
+                })
             } else {
-                let mut plan = sample_plan();
-                plan.edid_source = self.dir.join("source.bin");
                 build_install_script(&plan)
             };
             let script = script
@@ -1334,6 +1417,15 @@ mod tests {
                     "/etc/mkinitcpio.d",
                     &self.dir.join("presets").display().to_string(),
                 );
+            // Simulate the preset backend without discovering the host's real
+            // limine-mkinitcpio through the inherited utility PATH.
+            let script = if self.dir.join("without-limine").exists() {
+                format!(
+                    "command() {{ if [ \"$1\" = -v ] && [ \"$2\" = limine-mkinitcpio ]; then return 1; fi; builtin command \"$@\"; }}\n{script}"
+                )
+            } else {
+                script
+            };
             Command::new("bash")
                 .args(["-c", &script])
                 .env(
@@ -1350,6 +1442,10 @@ mod tests {
 
         fn firmware(&self) -> PathBuf {
             self.dir.join("firmware/drmcru_custom_DP-1.bin")
+        }
+
+        fn mkinitcpio_dropin(&self) -> PathBuf {
+            self.dir.join("mkinitcpio.conf.d/20-drmcru.conf")
         }
     }
 
@@ -1404,7 +1500,9 @@ mod tests {
     fn install_rolls_back_when_a_backup_helper_fails() {
         let fixture = ScriptFixture::new();
         fs::write(fixture.firmware(), b"old-edid").unwrap();
-        let mkinit = fixture.dir.join("mkinitcpio.conf");
+        let mkinit = fixture.mkinitcpio_dropin();
+        fs::create_dir_all(mkinit.parent().unwrap()).unwrap();
+        fs::write(&mkinit, "FILES+=(\"/keep.bin\")\n").unwrap();
         fixture.command(
             "cp",
             &format!(
@@ -1415,7 +1513,10 @@ mod tests {
         let output = fixture.run(false);
         assert!(!output.status.success());
         assert_eq!(fs::read(fixture.firmware()).unwrap(), b"old-edid");
-        assert_eq!(fs::read_to_string(mkinit).unwrap(), "FILES=()\n");
+        assert_eq!(
+            fs::read_to_string(mkinit).unwrap(),
+            "FILES+=(\"/keep.bin\")\n"
+        );
     }
 
     #[test]
@@ -1430,6 +1531,13 @@ mod tests {
                 sample_plan().kernel_parameter
             );
             fs::write(fixture.dir.join("mkinitcpio.conf"), &mkinit).unwrap();
+            fs::create_dir_all(fixture.mkinitcpio_dropin().parent().unwrap()).unwrap();
+            let mkinit_dropin = format!(
+                "FILES+=(\"{}\"{})\n",
+                fixture.firmware().display(),
+                if uninstall { "" } else { " \"/keep.bin\"" }
+            );
+            fs::write(fixture.mkinitcpio_dropin(), &mkinit_dropin).unwrap();
             fs::write(fixture.dir.join("limine.conf"), &limine).unwrap();
             fs::write(fixture.dir.join("entry-tool/drmcru-edid.conf"), &dropin).unwrap();
             fixture.command("limine-mkinitcpio", "exit 42");
@@ -1438,6 +1546,10 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap(),
                 mkinit
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap(),
+                mkinit_dropin
             );
             assert_eq!(
                 fs::read_to_string(fixture.dir.join("limine.conf")).unwrap(),
@@ -1483,11 +1595,8 @@ mod tests {
     fn install_does_not_mistake_comments_for_files_entries() {
         let fixture = ScriptFixture::new();
         let path = fixture.firmware().display().to_string();
-        fs::write(
-            fixture.dir.join("mkinitcpio.conf"),
-            format!("# FILES=({path})\nFILES=(\n /keep.bin # ) is a comment\n)\n"),
-        )
-        .unwrap();
+        let original = format!("# FILES=({path})\nFILES=(\n /keep.bin # ) is a comment\n)\n");
+        fs::write(fixture.dir.join("mkinitcpio.conf"), &original).unwrap();
         for _ in 0..2 {
             let output = fixture.run(false);
             assert!(
@@ -1497,26 +1606,41 @@ mod tests {
             );
         }
         let config = fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap();
-        assert_eq!(config.matches(&format!("\"{path}\"")).count(), 1);
-        assert!(config.contains("/keep.bin # ) is a comment"));
+        assert_eq!(config, original);
+        let dropin = fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap();
+        assert_eq!(dropin.matches(&format!("\"{path}\"")).count(), 1);
     }
 
     #[test]
-    fn unsupported_files_syntax_fails_with_rollback_and_an_explanation() {
+    fn new_install_preserves_dynamic_files_and_appends_through_the_dropin() {
         let fixture = ScriptFixture::new();
         let original = "FILES=($(printf /keep.bin))\n";
         fs::write(fixture.dir.join("mkinitcpio.conf"), original).unwrap();
         let output = fixture.run(false);
-        assert!(!output.status.success());
         assert!(
+            output.status.success(),
+            "{}",
             String::from_utf8_lossy(&output.stderr)
-                .contains("command substitutions are unsupported")
         );
         assert_eq!(
             fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap(),
             original
         );
-        assert!(!fixture.firmware().exists());
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                ". \"$1\"; . \"$2\"; printf '%s\\n' \"${FILES[@]}\"",
+                "bash",
+            ])
+            .arg(fixture.dir.join("mkinitcpio.conf"))
+            .arg(fixture.mkinitcpio_dropin())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("/keep.bin\n{}\n", fixture.firmware().display())
+        );
     }
 
     #[test]
@@ -1536,6 +1660,319 @@ mod tests {
         assert!(config.contains(&format!("'{path}.other'")), "{config}");
         assert!(config.contains(&format!("OTHER='{path}'")));
         assert!(config.contains(&format!("# Keep this comment: {path}")));
+    }
+
+    #[test]
+    fn install_migrates_legacy_entries_without_removing_other_files() {
+        let fixture = ScriptFixture::new();
+        let path = fixture.firmware().display().to_string();
+        fs::write(fixture.dir.join("mkinitcpio.conf"), format!(
+            "# Keep this comment: {path}\nFILES=(\n \"{path}\"\n /other-monitor.bin\n '{path}.other'\n)\nFILES+=(\"{path}\")\n"
+        )).unwrap();
+        for _ in 0..2 {
+            let output = fixture.run(false);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let config = fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap();
+        assert!(!config.contains(&format!("\"{path}\"")));
+        assert!(config.contains("/other-monitor.bin"));
+        assert!(config.contains(&format!("'{path}.other'")));
+        assert!(config.contains(&format!("# Keep this comment: {path}")));
+        let dropin = fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap();
+        assert_eq!(dropin.matches(&format!("\"{path}\"")).count(), 1);
+        assert!(dropin.contains("FILES+="));
+    }
+
+    #[test]
+    fn dropin_retains_other_monitors_and_is_removed_after_the_last_uninstall() {
+        let fixture = ScriptFixture::new();
+        let original = "FILES=(/keep.bin)\n";
+        fs::write(fixture.dir.join("mkinitcpio.conf"), original).unwrap();
+        for connector in ["DP-1", "HDMI-A-1", "DP-1"] {
+            let output = fixture.run_for_connector(false, connector);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let dropin = fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap();
+        assert_eq!(dropin.matches("drmcru_custom_DP-1.bin").count(), 1);
+        assert_eq!(dropin.matches("drmcru_custom_HDMI-A-1.bin").count(), 1);
+        let output = fixture.run(true);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dropin = fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap();
+        assert!(!dropin.contains("drmcru_custom_DP-1.bin"));
+        assert!(dropin.contains("drmcru_custom_HDMI-A-1.bin"));
+        assert!(!fixture.firmware().exists());
+        assert!(
+            fixture
+                .dir
+                .join("firmware/drmcru_custom_HDMI-A-1.bin")
+                .exists()
+        );
+        let output = fixture.run_for_connector(true, "HDMI-A-1");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!fixture.mkinitcpio_dropin().exists());
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn existing_dropin_assignments_are_converted_to_appends_and_settings_retained() {
+        let fixture = ScriptFixture::new();
+        fs::create_dir_all(fixture.mkinitcpio_dropin().parent().unwrap()).unwrap();
+        fs::write(
+            fixture.mkinitcpio_dropin(),
+            "# Keep this comment\nFILES=(/other-monitor.bin)\nCOMPRESSION=zstd\n",
+        )
+        .unwrap();
+        let output = fixture.run(false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dropin = fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap();
+        assert!(dropin.contains("FILES+=(/other-monitor.bin"));
+        assert!(dropin.contains("COMPRESSION=zstd"));
+        let output = fixture.run(true);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dropin = fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap();
+        assert!(dropin.contains("/other-monitor.bin"));
+        assert!(dropin.contains("COMPRESSION=zstd"));
+        assert!(dropin.contains("# Keep this comment"));
+    }
+
+    #[test]
+    fn multiple_dropin_arrays_keep_one_entry_per_installed_connector() {
+        let fixture = ScriptFixture::new();
+        fs::create_dir_all(fixture.mkinitcpio_dropin().parent().unwrap()).unwrap();
+        let path = fixture.firmware().display().to_string();
+        fs::write(
+            fixture.mkinitcpio_dropin(),
+            format!("FILES+=(/keep-a.bin \"{path}\")\nFILES+=(/keep-b.bin \"{path}\")\n"),
+        )
+        .unwrap();
+        for connector in ["DP-1", "HDMI-A-1", "DP-1", "HDMI-A-1"] {
+            let output = fixture.run_for_connector(false, connector);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let dropin = fs::read_to_string(fixture.mkinitcpio_dropin()).unwrap();
+        assert_eq!(dropin.matches("drmcru_custom_DP-1.bin").count(), 1);
+        assert_eq!(dropin.matches("drmcru_custom_HDMI-A-1.bin").count(), 1);
+        assert!(dropin.contains("/keep-a.bin"));
+        assert!(dropin.contains("/keep-b.bin"));
+    }
+
+    #[test]
+    fn failed_new_install_removes_new_dropin_and_restores_boot_configuration() {
+        let fixture = ScriptFixture::new();
+        fixture.command("limine-mkinitcpio", "exit 42");
+        let output = fixture.run(false);
+        assert!(!output.status.success());
+        assert!(!fixture.firmware().exists());
+        assert!(!fixture.mkinitcpio_dropin().exists());
+        assert!(!fixture.mkinitcpio_dropin().parent().unwrap().exists());
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap(),
+            "FILES=()\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("limine.conf")).unwrap(),
+            "cmdline: quiet\n"
+        );
+        assert!(!fixture.dir.join("entry-tool/drmcru-edid.conf").exists());
+    }
+
+    #[test]
+    fn unsupported_legacy_syntax_rolls_back_the_new_dropin_and_firmware() {
+        let fixture = ScriptFixture::new();
+        let original = format!(
+            "FILES=(\"{}\" $(printf /keep.bin))\n",
+            fixture.firmware().display()
+        );
+        fs::write(fixture.dir.join("mkinitcpio.conf"), &original).unwrap();
+        let output = fixture.run(false);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("command substitutions are unsupported")
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("mkinitcpio.conf")).unwrap(),
+            original
+        );
+        assert!(!fixture.firmware().exists());
+        assert!(!fixture.mkinitcpio_dropin().exists());
+    }
+
+    #[test]
+    fn preset_backend_rejects_explicit_configs_before_install_or_uninstall_changes() {
+        for uninstall in [false, true] {
+            let fixture = ScriptFixture::new();
+            fs::write(fixture.dir.join("without-limine"), "").unwrap();
+            fs::create_dir_all(fixture.dir.join("presets")).unwrap();
+            fs::write(
+                fixture.dir.join("presets/linux.preset"),
+                "ALL_config='/etc/mkinitcpio.conf'\n",
+            )
+            .unwrap();
+            fs::write(fixture.firmware(), b"old-edid").unwrap();
+            let output = fixture.run(uninstall);
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("explicit mkinitcpio config disables")
+            );
+            assert_eq!(fs::read(fixture.firmware()).unwrap(), b"old-edid");
+            assert!(!fixture.mkinitcpio_dropin().exists());
+            assert_eq!(
+                fs::read_to_string(fixture.dir.join("limine.conf")).unwrap(),
+                "cmdline: quiet\n"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_dropin_path_is_rejected_before_any_system_files_change() {
+        let fixture = ScriptFixture::new();
+        fs::create_dir_all(fixture.mkinitcpio_dropin()).unwrap();
+        fs::write(fixture.firmware(), b"old-edid").unwrap();
+        for uninstall in [false, true] {
+            let output = fixture.run(uninstall);
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("must be a regular configuration file")
+            );
+            assert_eq!(fs::read(fixture.firmware()).unwrap(), b"old-edid");
+            assert_eq!(
+                fs::read_to_string(fixture.dir.join("limine.conf")).unwrap(),
+                "cmdline: quiet\n"
+            );
+        }
+    }
+
+    #[test]
+    fn preset_backend_accepts_default_configs_and_rebuilds_with_the_dropin() {
+        let fixture = ScriptFixture::new();
+        fs::write(fixture.dir.join("without-limine"), "").unwrap();
+        fs::create_dir_all(fixture.dir.join("presets")).unwrap();
+        fs::write(fixture.dir.join("presets/linux.preset"), "#ALL_config='/etc/mkinitcpio.conf'\nALL_config=''\ndefault_config=\"\" # use default\n").unwrap();
+        // Read the effective FILES just as mkinitcpio does; do not rebuild any
+        // real image or run the host's Limine helpers.
+        fixture.command(
+            "mkinitcpio",
+            &format!(
+                ". {}\n. {}\nprintf '%s\\n' \"${{FILES[@]}}\" > {}",
+                shell_quote(&fixture.dir.join("mkinitcpio.conf").display().to_string()),
+                shell_quote(&fixture.mkinitcpio_dropin().display().to_string()),
+                shell_quote(&fixture.dir.join("rebuild-files").display().to_string())
+            ),
+        );
+        let output = fixture.run(false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.dir.join("rebuild-files")).unwrap(),
+            format!("{}\n", fixture.firmware().display())
+        );
+    }
+
+    #[test]
+    fn support_report_detects_explicit_preset_configs_without_executing_them() {
+        let fixture = ScriptFixture::new();
+        let presets = fixture.dir.join("presets");
+        fs::create_dir_all(&presets).unwrap();
+        let marker = fixture.dir.join("must-not-execute");
+        for assignment in [
+            "ALL_config='/etc/mkinitcpio.conf'".to_string(),
+            "export default_config=\"/custom.conf\"".to_string(),
+            format!(
+                "ALL_config=$(touch {})",
+                shell_quote(&marker.display().to_string())
+            ),
+        ] {
+            fs::write(presets.join("linux.preset"), assignment).unwrap();
+            let report = inspect_system_support_with_paths(
+                &fixture.dir.join("mkinitcpio.conf"),
+                &presets,
+                &fixture.dir.join("limine.conf"),
+                true,
+                true,
+                false,
+            );
+            assert!(!report.is_supported());
+            assert!(
+                report
+                    .report_text()
+                    .contains("explicit mkinitcpio config disables")
+            );
+            assert!(!marker.exists());
+            // The Limine backend does not build through these presets.
+            let report = inspect_system_support_with_paths(
+                &fixture.dir.join("mkinitcpio.conf"),
+                &presets,
+                &fixture.dir.join("limine.conf"),
+                true,
+                true,
+                true,
+            );
+            assert!(report.is_supported());
+        }
+    }
+
+    #[test]
+    fn installed_override_status_finds_dropin_without_a_legacy_reference() {
+        let fixture = ScriptFixture::new();
+        let output = fixture.run(false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status = inspect_override_with_paths(
+            "DP-1",
+            "drmcru_custom_DP-1.bin",
+            &sample_plan().kernel_parameter,
+            OverrideInspectionPaths {
+                firmware_target: &fixture.firmware(),
+                mkinitcpio_conf: &fixture.dir.join("mkinitcpio.conf"),
+                mkinitcpio_dropin: &fixture.mkinitcpio_dropin(),
+                bootloader_conf: &fixture.dir.join("limine.conf"),
+                limine_entry_tool_dropin: &fixture.dir.join("entry-tool/drmcru-edid.conf"),
+                active_cmdline: &fixture.dir.join("no-active-cmdline"),
+            },
+        );
+        assert!(status.mkinitcpio_references_firmware);
+        assert_eq!(status.short_label(), "installed, reboot pending");
+        assert!(status.read_warnings.is_empty());
     }
 
     #[test]
@@ -1630,6 +2067,7 @@ mod tests {
     fn script_creates_backups_before_config_edits() {
         let script = build_install_script(&sample_plan());
         assert!(script.contains("BACKUP_SUFFIX"));
+        assert!(script.contains("backup_file \"$MKINIT_DROPIN\""));
         assert!(script.contains("backup_file \"$MKINIT\""));
         assert!(script.contains("backup_file \"$LIMINE\""));
         assert!(script.contains("backup_file \"$LIMINE_DROPIN\""));
@@ -1793,14 +2231,15 @@ mod tests {
     fn uninstall_preview_has_all_targets() {
         let preview = UninstallPreview::from_plan(&sample_uninstall_plan());
         let lines = preview.summary_lines();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
         assert!(lines[0].contains("DP-1"));
         assert!(lines[1].contains("Remove"));
         assert!(lines[2].contains("mkinitcpio"));
-        assert!(lines[3].contains("limine"));
-        assert!(lines[4].contains("limine-entry-tool"));
-        assert!(lines[5].contains("drm.edid_firmware"));
-        assert!(lines[6].contains("limine-mkinitcpio"));
+        assert!(lines[3].contains("legacy"));
+        assert!(lines[4].contains("limine"));
+        assert!(lines[5].contains("limine-entry-tool"));
+        assert!(lines[6].contains("drm.edid_firmware"));
+        assert!(lines[7].contains("limine-mkinitcpio"));
     }
 
     #[test]
@@ -1831,6 +2270,7 @@ mod tests {
             OverrideInspectionPaths {
                 firmware_target: &firmware,
                 mkinitcpio_conf: &mkinit,
+                mkinitcpio_dropin: &dir.join("20-drmcru.conf"),
                 bootloader_conf: &limine,
                 limine_entry_tool_dropin: &limine_dropin,
                 active_cmdline: &cmdline,
@@ -1871,6 +2311,7 @@ mod tests {
             OverrideInspectionPaths {
                 firmware_target: &firmware,
                 mkinitcpio_conf: &mkinit,
+                mkinitcpio_dropin: &dir.join("20-drmcru.conf"),
                 bootloader_conf: &limine,
                 limine_entry_tool_dropin: &limine_dropin,
                 active_cmdline: &cmdline,
@@ -1906,6 +2347,7 @@ mod tests {
             OverrideInspectionPaths {
                 firmware_target: &firmware,
                 mkinitcpio_conf: &mkinit,
+                mkinitcpio_dropin: &dir.join("20-drmcru.conf"),
                 bootloader_conf: &limine,
                 limine_entry_tool_dropin: &limine_dropin,
                 active_cmdline: &cmdline,
@@ -1961,13 +2403,14 @@ mod tests {
     fn preview_summary_has_all_targets() {
         let preview = InstallPreview::from_plan(&sample_plan());
         let lines = preview.summary_lines();
-        assert!(lines.len() == 7);
+        assert_eq!(lines.len(), 8);
         assert!(lines[0].contains("DP-1"));
         assert!(lines[1].contains("firmware"));
         assert!(lines[2].contains("mkinitcpio"));
-        assert!(lines[3].contains("limine"));
-        assert!(lines[4].contains("limine-entry-tool"));
-        assert!(lines[5].contains("drm.edid_firmware"));
-        assert!(lines[6].contains("limine-mkinitcpio"));
+        assert!(lines[3].contains("legacy"));
+        assert!(lines[4].contains("limine"));
+        assert!(lines[5].contains("limine-entry-tool"));
+        assert!(lines[6].contains("drm.edid_firmware"));
+        assert!(lines[7].contains("limine-mkinitcpio"));
     }
 }

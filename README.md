@@ -141,7 +141,7 @@ drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin
 On the supported Limine/mkinitcpio path, Install/Update modifies:
 
 - `/lib/firmware/edid/<name>.bin`
-- `/etc/mkinitcpio.conf`
+- `/etc/mkinitcpio.conf.d/20-drmcru.conf`
 - `/boot/limine.conf`
 - `/etc/limine-entry-tool.d/drmcru-edid.conf` when `limine-mkinitcpio` is used
 
@@ -150,6 +150,17 @@ firmware files. Existing overrides for other connectors are retained in the same
 kernel parameter. If an install or rebuild step fails, the script restores all
 files changed by that run.
 
+The mkinitcpio drop-in appends EDID paths with `FILES+=(...)`, preserving existing
+files and overrides for other monitors. Install/Update migrates this monitor's
+legacy entry from `/etc/mkinitcpio.conf` when present. Uninstall removes its entry
+and deletes the drmcru drop-in when no overrides remain.
+
+Automatic Apply requires mkinitcpio to read its default configuration and
+drop-ins. Presets with explicit `*_config` assignments disable drop-ins and are
+rejected when using `mkinitcpio -P`. Custom Limine UKI options must also avoid
+`-c`/`--config`. Export includes instructions for configuring those systems
+manually.
+
 ## Recovery
 
 If a custom mode is unusable but the desktop remains accessible, switch back
@@ -157,9 +168,9 @@ to a known-good mode, choose Uninstall in `drmcru`, and reboot.
 
 If the graphical session is unusable, boot once without the
 `drm.edid_firmware=...` parameter using the Limine entry editor or another boot
-entry. Then run `drmcru`, choose Uninstall, and reboot. Automatic changes to
-`mkinitcpio.conf` and `limine.conf` have timestamped backups beside the original
-files.
+entry. Then run `drmcru`, choose Uninstall, and reboot. Changed configuration
+files have timestamped backups beside the originals, including the main
+`mkinitcpio.conf` when migrating a legacy installation.
 
 ## First-run troubleshooting
 

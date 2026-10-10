@@ -59,8 +59,9 @@ pub fn export_instructions(edid_path: &Path, plan: &ExportPlan) -> String {
         ),
         String::new(),
         "2. Ensure the EDID is available in the early initramfs.".to_string(),
-        "   With mkinitcpio, add the install target above to FILES in /etc/mkinitcpio.conf."
+        "   With mkinitcpio, append the install target using FILES+=(...) in /etc/mkinitcpio.conf.d/20-drmcru.conf."
             .to_string(),
+        "   Explicit -c/--config options or preset *_config assignments disable drop-ins; in that case, add it to FILES in the selected config instead.".to_string(),
         String::new(),
         "3. Add this kernel parameter to your bootloader:".to_string(),
         format!("   {}", plan.drm_kernel_parameter()),
@@ -214,7 +215,7 @@ mod tests {
         let instructions = export_instructions(Path::new("/tmp/drmcru_custom_DP-1.bin"), &plan);
 
         assert!(instructions.contains("sudo install -D -m 0644"));
-        assert!(instructions.contains("FILES in /etc/mkinitcpio.conf"));
+        assert!(instructions.contains("FILES+=(...) in /etc/mkinitcpio.conf.d/20-drmcru.conf"));
         assert!(instructions.contains("drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin"));
         assert!(instructions.contains("monitor=DP-1,1920x1080@"));
         assert!(instructions.contains(",auto,1"));
