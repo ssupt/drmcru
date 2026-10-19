@@ -249,6 +249,7 @@ mod tests {
             limine_mkinitcpio_available: true,
             limine_conf_present: true,
             limine_has_cmdline: true,
+            limine_validation_deferred: false,
             read_warnings: Vec::new(),
         }
     }

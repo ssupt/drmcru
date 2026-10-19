@@ -92,6 +92,9 @@ pub struct SystemSupportReport {
     pub limine_mkinitcpio_available: bool,
     pub limine_conf_present: bool,
     pub limine_has_cmdline: bool,
+    /// The desktop user cannot read the Limine config, so the root installer
+    /// must validate it after authentication.
+    pub limine_validation_deferred: bool,
     pub read_warnings: Vec<String>,
 }
 
@@ -176,7 +179,7 @@ impl SystemSupportReport {
         }
         if !self.limine_conf_present {
             issues.push("/boot/limine.conf was not found".to_string());
-        } else if !self.limine_has_cmdline {
+        } else if !self.limine_validation_deferred && !self.limine_has_cmdline {
             issues.push("/boot/limine.conf has no cmdline: entries".to_string());
         }
         issues.extend(self.read_warnings.iter().cloned());
@@ -206,14 +209,23 @@ impl SystemSupportReport {
                 "Preflight: rebuild backend {}",
                 self.rebuild_backend_label()
             ),
-            format!(
-                "Preflight: /boot/limine.conf {}",
-                yes_no(self.limine_conf_present)
-            ),
-            format!(
-                "Preflight: Limine cmdline entries {}",
-                yes_no(self.limine_has_cmdline)
-            ),
+            if self.limine_validation_deferred {
+                "Preflight: /boot/limine.conf deferred (will verify after authentication)"
+                    .to_string()
+            } else {
+                format!(
+                    "Preflight: /boot/limine.conf {}",
+                    yes_no(self.limine_conf_present)
+                )
+            },
+            if self.limine_validation_deferred {
+                "Preflight: Limine cmdline entries deferred".to_string()
+            } else {
+                format!(
+                    "Preflight: Limine cmdline entries {}",
+                    yes_no(self.limine_has_cmdline)
+                )
+            },
         ]
     }
 
@@ -394,23 +406,8 @@ fn inspect_system_support_with_paths(
     if !limine_mkinitcpio_available && mkinitcpio_presets_present {
         inspect_preset_dropin_support(mkinitcpio_dir, &mut read_warnings);
     }
-    let limine_conf_present = path_exists(limine_conf, "Limine config", &mut read_warnings);
-    let limine_has_cmdline = if limine_conf_present {
-        match fs::read_to_string(limine_conf) {
-            Ok(contents) => contents
-                .lines()
-                .any(|line| line.trim_start().starts_with("cmdline:")),
-            Err(error) => {
-                read_warnings.push(format!(
-                    "Could not read Limine config {}: {error}",
-                    limine_conf.display()
-                ));
-                false
-            }
-        }
-    } else {
-        false
-    };
+    let (limine_conf_present, limine_has_cmdline, limine_validation_deferred) =
+        inspect_limine_config(limine_conf, &mut read_warnings);
 
     SystemSupportReport {
         pkexec_available,
@@ -420,7 +417,40 @@ fn inspect_system_support_with_paths(
         limine_mkinitcpio_available,
         limine_conf_present,
         limine_has_cmdline,
+        limine_validation_deferred,
         read_warnings,
+    }
+}
+
+fn inspect_limine_config(path: &Path, warnings: &mut Vec<String>) -> (bool, bool, bool) {
+    inspect_limine_config_read(fs::read_to_string(path), path, warnings)
+}
+
+fn inspect_limine_config_read(
+    result: io::Result<String>,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> (bool, bool, bool) {
+    match result {
+        Ok(contents) => (
+            true,
+            contents
+                .lines()
+                .any(|line| line.trim_start().starts_with("cmdline:")),
+            false,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (false, false, false),
+        // The privileged installer performs the same validation before making
+        // changes. Do not prevent it from reaching pkexec just because /boot
+        // is intentionally unreadable to the desktop user.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => (true, false, true),
+        Err(error) => {
+            warnings.push(format!(
+                "Could not read Limine config {}: {error}",
+                path.display()
+            ));
+            (false, false, false)
+        }
     }
 }
 
@@ -2013,6 +2043,39 @@ mod tests {
         assert_eq!(report.rebuild_backend_label(), "limine-mkinitcpio");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_support_defers_protected_limine_config_to_privileged_installer() {
+        let limine = Path::new("/boot/limine.conf");
+
+        let mut warnings = Vec::new();
+        let result = inspect_limine_config_read(
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            limine,
+            &mut warnings,
+        );
+        assert_eq!(result, (true, false, true));
+        assert!(warnings.is_empty());
+
+        let report = SystemSupportReport {
+            pkexec_available: true,
+            mkinitcpio_available: true,
+            mkinitcpio_conf_present: true,
+            mkinitcpio_presets_present: false,
+            limine_mkinitcpio_available: true,
+            limine_conf_present: result.0,
+            limine_has_cmdline: result.1,
+            limine_validation_deferred: result.2,
+            read_warnings: warnings,
+        };
+        assert!(report.is_supported());
+        assert!(
+            report
+                .summary_lines()
+                .iter()
+                .any(|line| line.contains("will verify after authentication"))
+        );
     }
 
     #[test]
