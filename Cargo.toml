@@ -2,7 +2,7 @@
 name = "drmcru"
 version = "0.1.5"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "Linux DRM/KMS custom resolution and EDID override utility"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -22,8 +22,8 @@ exclude = [
 
 [dependencies]
 anyhow = "1.0"
-crossterm = "0.28"
-ratatui = "0.29"
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

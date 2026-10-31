@@ -58,7 +58,7 @@ can hide the active Hyprland session and create root-owned exports.
 
 ## Build From Source
 
-Rust 1.87 or newer is required.
+Rust 1.88 or newer is required.
 
 ```sh
 git clone https://github.com/ssupt/drmcru.git
