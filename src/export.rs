@@ -229,7 +229,7 @@ mod tests {
         raw[71] |= 0x61;
         raw[154] |= 0x61;
         // Repair fixture checksums before exercising validation and export.
-        for block in raw.chunks_exact_mut(128) {
+        for block in raw.as_chunks_mut::<128>().0.iter_mut() {
             block[127] = 0u8.wrapping_sub(
                 block[..127]
                     .iter()
@@ -260,8 +260,10 @@ mod tests {
         }
         assert!(
             bytes
-                .chunks_exact(128)
-                .all(crate::edid::block_checksum_valid)
+                .as_chunks::<128>()
+                .0
+                .iter()
+                .all(|block| crate::edid::block_checksum_valid(block))
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -273,7 +275,7 @@ mod tests {
         for (offset, flags) in [(71, 0x19), (89, 0x1b), (154, 0x1b), (172, 0x19)] {
             raw[offset] = flags;
         }
-        for block in raw.chunks_exact_mut(128) {
+        for block in raw.as_chunks_mut::<128>().0.iter_mut() {
             block[127] = 0u8.wrapping_sub(
                 block[..127]
                     .iter()
@@ -318,8 +320,10 @@ mod tests {
         assert_eq!(exported, expected);
         assert!(
             exported
-                .chunks_exact(128)
-                .all(crate::edid::block_checksum_valid)
+                .as_chunks::<128>()
+                .0
+                .iter()
+                .all(|block| crate::edid::block_checksum_valid(block))
         );
         fs::remove_dir_all(directory).unwrap();
     }

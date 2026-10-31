@@ -67,15 +67,14 @@ impl App {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.vrr_editor.is_some() {
-            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                if let Some(hitbox) = self.hit_test(mouse.column, mouse.row) {
-                    if matches!(
-                        hitbox.target,
-                        HitTarget::VrrField(_) | HitTarget::ModalButton(_)
-                    ) {
-                        self.activate_hit(hitbox, mouse.column);
-                    }
-                }
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && let Some(hitbox) = self.hit_test(mouse.column, mouse.row)
+                && matches!(
+                    hitbox.target,
+                    HitTarget::VrrField(_) | HitTarget::ModalButton(_)
+                )
+            {
+                self.activate_hit(hitbox, mouse.column);
             }
             return;
         }

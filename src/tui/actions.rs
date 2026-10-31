@@ -660,10 +660,10 @@ impl App {
 
         let mut deleted = 0usize;
         for location in locations {
-            if let Some(workspace) = self.selected_workspace_mut() {
-                if workspace.delete_dtd(location).is_ok() {
-                    deleted += 1;
-                }
+            if let Some(workspace) = self.selected_workspace_mut()
+                && workspace.delete_dtd(location).is_ok()
+            {
+                deleted += 1;
             }
         }
         self.selected_extension = None;
@@ -1173,10 +1173,11 @@ impl App {
     }
 
     fn selected_or_first_free_cta_slot(&self) -> Option<(u8, usize)> {
-        if let Some(row) = self.selected_extension_slot() {
-            if row.timing.is_none() && !row.occupied_unknown {
-                return Some((row.extension_index, row.slot));
-            }
+        if let Some(row) = self.selected_extension_slot()
+            && row.timing.is_none()
+            && !row.occupied_unknown
+        {
+            return Some((row.extension_index, row.slot));
         }
 
         self.working_extension_rows()
@@ -1432,17 +1433,17 @@ impl App {
             }
         }
 
-        if let Some(status) = override_status {
-            if !status.read_warnings.is_empty() {
-                lines.push(String::new());
-                lines.push("Read warnings".to_string());
-                lines.extend(
-                    status
-                        .read_warnings
-                        .into_iter()
-                        .map(|warning| format!("- {warning}")),
-                );
-            }
+        if let Some(status) = override_status
+            && !status.read_warnings.is_empty()
+        {
+            lines.push(String::new());
+            lines.push("Read warnings".to_string());
+            lines.extend(
+                status
+                    .read_warnings
+                    .into_iter()
+                    .map(|warning| format!("- {warning}")),
+            );
         }
 
         self.detailed_editor = None;
@@ -2156,15 +2157,15 @@ pub(super) fn normalize_import_path(value: &str, home: Option<&Path>) -> PathBuf
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from(value));
     }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = home {
-            return home.join(rest);
-        }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = home
+    {
+        return home.join(rest);
     }
-    if let Some(rest) = value.strip_prefix("$HOME/") {
-        if let Some(home) = home {
-            return home.join(rest);
-        }
+    if let Some(rest) = value.strip_prefix("$HOME/")
+        && let Some(home) = home
+    {
+        return home.join(rest);
     }
 
     PathBuf::from(value)

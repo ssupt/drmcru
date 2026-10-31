@@ -289,7 +289,7 @@ impl EdidWorkspace {
             });
         }
 
-        for (index, block) in self.working.raw.chunks_exact(128).enumerate() {
+        for (index, block) in self.working.raw.as_chunks::<128>().0.iter().enumerate() {
             if !block_checksum_valid(block) {
                 issues.push(ValidationIssue {
                     message: if index == 0 {
