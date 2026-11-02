@@ -96,7 +96,8 @@ is_snapper_installed() { [ "$TEST_NO_EMBED" = yes ]; }
 previous=""; source=""
 for argument in "$@"; do source="$previous"; previous="$argument"; done
 target="$previous"
-if tar -tf "$source" | grep -qx './.cmdline'; then
+# Drain the listing: grep -q can close early and make tar fail with SIGPIPE.
+if tar -tf "$source" | grep -x './.cmdline' >/dev/null; then
     tar -xOf "$source" ./.cmdline > "$target"
 else : > "$target"; fi
 "#,
