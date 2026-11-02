@@ -13,8 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install minimum supported Rust
-        run: rustup toolchain install 1.87.0 --profile minimal
-      - run: cargo +1.87.0 test --locked
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - run: cargo +1.88.0 test --locked
 
   checks:
     runs-on: ubuntu-22.04

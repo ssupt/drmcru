@@ -279,6 +279,11 @@ impl EdidWorkspace {
 
     pub fn validate(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
+        issues.extend(
+            crate::edid::cta_layout_issues(&self.working.raw)
+                .into_iter()
+                .map(|message| ValidationIssue { message }),
+        );
         let expected_len = (usize::from(self.working.extension_blocks) + 1) * 128;
         if self.working.raw.len() != expected_len {
             issues.push(ValidationIssue {
@@ -289,7 +294,7 @@ impl EdidWorkspace {
             });
         }
 
-        for (index, block) in self.working.raw.chunks_exact(128).enumerate() {
+        for (index, block) in self.working.raw.as_chunks::<128>().0.iter().enumerate() {
             if !block_checksum_valid(block) {
                 issues.push(ValidationIssue {
                     message: if index == 0 {

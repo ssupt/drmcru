@@ -207,7 +207,7 @@ fn exact_timing(request: CvtRequest, current: Option<&TimingDescriptor>) -> Timi
     timing.pixel_clock_khz = exact_pixel_clock_khz(
         u32::from(timing.h_total()),
         u32::from(timing.v_total()),
-        request.refresh_hz,
+        request.refresh_hz / if timing.interlaced { 2.0 } else { 1.0 },
     );
     timing
 }

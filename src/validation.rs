@@ -66,16 +66,22 @@ pub fn validate_timing(timing: &TimingDescriptor) -> Vec<TimingWarning> {
 
     validate_12_bit(&mut warnings, "horizontal active", timing.h_active);
     validate_12_bit(&mut warnings, "horizontal blanking", timing.h_blanking);
-    validate_12_bit(&mut warnings, "vertical active", timing.v_active);
-    validate_12_bit(&mut warnings, "vertical blanking", timing.v_blanking);
+    if let Ok([active, blanking, front, sync, _]) = timing.edid_vertical_fields() {
+        validate_12_bit(&mut warnings, "vertical active field", active);
+        validate_12_bit(&mut warnings, "vertical blanking field", blanking);
+        validate_6_bit(&mut warnings, "vertical front porch field", front);
+        validate_6_bit(&mut warnings, "vertical sync width field", sync);
+    } else {
+        warnings.push(TimingWarning::error(
+            timing.edid_vertical_fields().unwrap_err(),
+        ));
+    }
     validate_10_bit(
         &mut warnings,
         "horizontal front porch",
         timing.h_front_porch,
     );
     validate_10_bit(&mut warnings, "horizontal sync width", timing.h_sync_width);
-    validate_6_bit(&mut warnings, "vertical front porch", timing.v_front_porch);
-    validate_6_bit(&mut warnings, "vertical sync width", timing.v_sync_width);
 
     let h_parts = u32::from(timing.h_front_porch)
         + u32::from(timing.h_sync_width)

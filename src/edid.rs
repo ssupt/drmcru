@@ -33,6 +33,8 @@ pub enum EdidError {
     NoVrrRange,
     #[error("VRR limits must be whole Hz between 1 and 510, with minimum <= maximum")]
     InvalidVrrRange,
+    #[error("{0}")]
+    InvalidInterlacedTiming(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +171,7 @@ pub fn parse_edid(raw: Vec<u8>) -> Result<EdidData, EdidError> {
     let mut descriptor_text = Vec::new();
     let mut detailed_timings = Vec::new();
 
-    for descriptor in base[DTD_START..126].chunks_exact(DTD_LEN) {
+    for descriptor in base[DTD_START..126].as_chunks::<DTD_LEN>().0.iter() {
         if descriptor[0] == 0 && descriptor[1] == 0 {
             match descriptor[3] {
                 0xfc => monitor_name = parse_descriptor_text(descriptor),
@@ -212,10 +214,10 @@ pub fn slot_summary(raw: &[u8]) -> Result<EdidSlotSummary, EdidError> {
         return Err(EdidError::InvalidHeader);
     }
 
-    let base_descriptors = raw[DTD_START..126].chunks_exact(DTD_LEN);
+    let base_descriptors = raw[DTD_START..126].as_chunks::<DTD_LEN>().0.iter();
     let base_dtd_used = base_descriptors
         .clone()
-        .filter(|descriptor| parse_detailed_timing(descriptor).is_some())
+        .filter(|descriptor| parse_detailed_timing(*descriptor).is_some())
         .count();
     let base_dtd_free = base_descriptors
         .filter(|descriptor| descriptor.iter().all(|byte| *byte == 0))
@@ -223,8 +225,10 @@ pub fn slot_summary(raw: &[u8]) -> Result<EdidSlotSummary, EdidError> {
     let standard_used = parse_standard_timings(&raw[..BASE_BLOCK_LEN]).len();
     let standard_free = raw[STANDARD_TIMING_START
         ..STANDARD_TIMING_START + STANDARD_TIMING_SLOTS * STANDARD_TIMING_LEN]
-        .chunks_exact(STANDARD_TIMING_LEN)
-        .filter(|timing| *timing == [0x01, 0x01])
+        .as_chunks::<STANDARD_TIMING_LEN>()
+        .0
+        .iter()
+        .filter(|timing| **timing == [0x01, 0x01])
         .count();
 
     let mut cta_dtd_used = 0;
@@ -243,7 +247,7 @@ pub fn slot_summary(raw: &[u8]) -> Result<EdidSlotSummary, EdidError> {
         let Some(dtd_range) = cta_dtd_range(block) else {
             continue;
         };
-        for descriptor in block[dtd_range].chunks_exact(DTD_LEN) {
+        for descriptor in block[dtd_range].as_chunks::<DTD_LEN>().0.iter() {
             if descriptor.iter().all(|byte| *byte == 0) {
                 cta_dtd_free += 1;
             } else if parse_detailed_timing(descriptor).is_some() {
@@ -466,7 +470,17 @@ pub fn patch_detailed_timing(
 pub fn delete_detailed_timing(raw: &[u8], location: DtdLocation) -> Result<Vec<u8>, EdidError> {
     let mut patched = raw.to_vec();
     let (offset, block_start) = dtd_offset(raw, location)?;
-    patched[offset..offset + DTD_LEN].fill(0);
+    if let DtdLocation::Cta { slot, .. } = location {
+        let native = patched[block_start + 3] & 0x0f;
+        if (patched[offset] != 0 || patched[offset + 1] != 0) && slot < usize::from(native) {
+            patched[block_start + 3] = (patched[block_start + 3] & 0xf0) | (native - 1);
+        }
+        let end = block_start + BLOCK_CHECKSUM_INDEX;
+        patched.copy_within(offset + DTD_LEN..end, offset);
+        patched[end - DTD_LEN..end].fill(0);
+    } else {
+        patched[offset..offset + DTD_LEN].fill(0);
+    }
     repair_block_checksum(&mut patched[block_start..block_start + EDID_BLOCK_LEN]);
     Ok(patched)
 }
@@ -515,7 +529,12 @@ pub fn detailed_timing_locations(raw: &[u8]) -> Result<Vec<LocatedDetailedTiming
     }
 
     let mut timings = Vec::new();
-    for (slot, descriptor) in raw[DTD_START..126].chunks_exact(DTD_LEN).enumerate() {
+    for (slot, descriptor) in raw[DTD_START..126]
+        .as_chunks::<DTD_LEN>()
+        .0
+        .iter()
+        .enumerate()
+    {
         if let Some(timing) = parse_detailed_timing(descriptor) {
             timings.push(LocatedDetailedTiming {
                 location: DtdLocation::Base { slot },
@@ -538,7 +557,7 @@ pub fn detailed_timing_locations(raw: &[u8]) -> Result<Vec<LocatedDetailedTiming
         let Some(dtd_range) = cta_dtd_range(block) else {
             continue;
         };
-        for (slot, descriptor) in block[dtd_range].chunks_exact(DTD_LEN).enumerate() {
+        for (slot, descriptor) in block[dtd_range].as_chunks::<DTD_LEN>().0.iter().enumerate() {
             if let Some(timing) = parse_detailed_timing(descriptor) {
                 timings.push(LocatedDetailedTiming {
                     location: DtdLocation::Cta {
@@ -578,7 +597,7 @@ pub fn cta_dtd_slots(raw: &[u8]) -> Result<Vec<CtaDtdSlot>, EdidError> {
             continue;
         };
 
-        for (slot, descriptor) in block[dtd_range].chunks_exact(DTD_LEN).enumerate() {
+        for (slot, descriptor) in block[dtd_range].as_chunks::<DTD_LEN>().0.iter().enumerate() {
             let is_free = descriptor.iter().all(|byte| *byte == 0);
             let timing = (!is_free)
                 .then(|| parse_detailed_timing(descriptor))
@@ -599,14 +618,17 @@ pub fn cta_dtd_slots(raw: &[u8]) -> Result<Vec<CtaDtdSlot>, EdidError> {
 }
 
 pub fn encode_detailed_timing(timing: &TimingDescriptor) -> Result<[u8; DTD_LEN], EdidError> {
+    let [v_active, v_blanking, v_front_porch, v_sync_width, _] = timing
+        .edid_vertical_fields()
+        .map_err(EdidError::InvalidInterlacedTiming)?;
     validate_12_bit("h_active", timing.h_active)?;
     validate_12_bit("h_blanking", timing.h_blanking)?;
-    validate_12_bit("v_active", timing.v_active)?;
-    validate_12_bit("v_blanking", timing.v_blanking)?;
+    validate_12_bit("v_active", v_active)?;
+    validate_12_bit("v_blanking", v_blanking)?;
     validate_10_bit("h_front_porch", timing.h_front_porch)?;
     validate_10_bit("h_sync_width", timing.h_sync_width)?;
-    validate_6_bit("v_front_porch", timing.v_front_porch)?;
-    validate_6_bit("v_sync_width", timing.v_sync_width)?;
+    validate_6_bit("v_front_porch", v_front_porch)?;
+    validate_6_bit("v_sync_width", v_sync_width)?;
 
     let pixel_clock_10khz = timing.pixel_clock_khz / 10;
     if pixel_clock_10khz == 0 {
@@ -622,16 +644,16 @@ pub fn encode_detailed_timing(timing: &TimingDescriptor) -> Result<[u8; DTD_LEN]
     descriptor[2] = low_byte(timing.h_active);
     descriptor[3] = low_byte(timing.h_blanking);
     descriptor[4] = high_nibble(timing.h_active) << 4 | high_nibble(timing.h_blanking);
-    descriptor[5] = low_byte(timing.v_active);
-    descriptor[6] = low_byte(timing.v_blanking);
-    descriptor[7] = high_nibble(timing.v_active) << 4 | high_nibble(timing.v_blanking);
+    descriptor[5] = low_byte(v_active);
+    descriptor[6] = low_byte(v_blanking);
+    descriptor[7] = high_nibble(v_active) << 4 | high_nibble(v_blanking);
     descriptor[8] = low_byte(timing.h_front_porch);
     descriptor[9] = low_byte(timing.h_sync_width);
-    descriptor[10] = low_nibble(timing.v_front_porch) << 4 | low_nibble(timing.v_sync_width);
+    descriptor[10] = low_nibble(v_front_porch) << 4 | low_nibble(v_sync_width);
     descriptor[11] = ((timing.h_front_porch >> 8) as u8 & 0x03) << 6
         | ((timing.h_sync_width >> 8) as u8 & 0x03) << 4
-        | ((timing.v_front_porch >> 4) as u8 & 0x03) << 2
-        | ((timing.v_sync_width >> 4) as u8 & 0x03);
+        | ((v_front_porch >> 4) as u8 & 0x03) << 2
+        | ((v_sync_width >> 4) as u8 & 0x03);
     descriptor[17] = 0x18
         | if timing.interlaced { 0x80 } else { 0 }
         | if timing.v_sync_positive { 0x04 } else { 0 }
@@ -718,7 +740,12 @@ pub fn clear_detailed_timing_stereo(raw: &mut [u8]) -> usize {
     }
     let extension_blocks = raw[126];
     let mut cleared = 0;
-    for (index, block) in raw.chunks_exact_mut(EDID_BLOCK_LEN).enumerate() {
+    for (index, block) in raw
+        .as_chunks_mut::<EDID_BLOCK_LEN>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         if index > usize::from(extension_blocks) {
             break;
         }
@@ -733,7 +760,7 @@ pub fn clear_detailed_timing_stereo(raw: &mut [u8]) -> usize {
             continue;
         };
         let mut changed = false;
-        for descriptor in block[range].chunks_exact_mut(DTD_LEN) {
+        for descriptor in block[range].as_chunks_mut::<DTD_LEN>().0.iter_mut() {
             if (descriptor[0] != 0 || descriptor[1] != 0) && descriptor[17] & 0x60 != 0 {
                 descriptor[17] &= !0x61;
                 cleared += 1;
@@ -889,7 +916,9 @@ fn parse_displayid_type_i_dtds(
     payload: &[u8],
 ) -> Vec<DisplayIdDetailedTiming> {
     payload
-        .chunks_exact(DISPLAYID_TYPE_I_DTD_LEN)
+        .as_chunks::<DISPLAYID_TYPE_I_DTD_LEN>()
+        .0
+        .iter()
         .enumerate()
         .filter_map(|(descriptor_index, descriptor)| {
             parse_displayid_type_i_dtd(
@@ -969,11 +998,15 @@ fn parse_cta_block(extension_index: u8, block: &[u8]) -> Option<Cta861Block> {
     let data_blocks = parse_cta_data_blocks(block);
     let (detailed_timings, available_dtd_slots) = if let Some(dtd_range) = cta_dtd_range(block) {
         let detailed_timings = block[dtd_range.clone()]
-            .chunks_exact(DTD_LEN)
-            .filter_map(parse_detailed_timing)
+            .as_chunks::<DTD_LEN>()
+            .0
+            .iter()
+            .filter_map(|descriptor| parse_detailed_timing(descriptor))
             .collect();
         let available_dtd_slots = block[dtd_range]
-            .chunks_exact(DTD_LEN)
+            .as_chunks::<DTD_LEN>()
+            .0
+            .iter()
             .filter(|descriptor| descriptor.iter().all(|byte| *byte == 0))
             .count();
         (detailed_timings, available_dtd_slots)
@@ -1104,7 +1137,9 @@ fn cta_vic_mode(vic: u16, native: bool) -> Option<CtaVideoMode> {
 
 fn base_empty_dtd_slot(raw: &[u8]) -> Option<(usize, usize)> {
     raw[DTD_START..126]
-        .chunks_exact(DTD_LEN)
+        .as_chunks::<DTD_LEN>()
+        .0
+        .iter()
         .enumerate()
         .find(|(_, descriptor)| descriptor.iter().all(|byte| *byte == 0))
         .map(|(slot, _)| (slot, DTD_START + slot * DTD_LEN))
@@ -1113,7 +1148,9 @@ fn base_empty_dtd_slot(raw: &[u8]) -> Option<(usize, usize)> {
 fn cta_empty_dtd_slot(block: &[u8]) -> Option<(usize, usize)> {
     let dtd_range = cta_dtd_range(block)?;
     block[dtd_range.clone()]
-        .chunks_exact(DTD_LEN)
+        .as_chunks::<DTD_LEN>()
+        .0
+        .iter()
         .enumerate()
         .find(|(_, descriptor)| descriptor.iter().all(|byte| *byte == 0))
         .map(|(slot, _)| (slot, dtd_range.start + slot * DTD_LEN))
@@ -1121,8 +1158,10 @@ fn cta_empty_dtd_slot(block: &[u8]) -> Option<(usize, usize)> {
 
 fn empty_standard_timing_slot(raw: &[u8]) -> Option<usize> {
     raw[STANDARD_TIMING_START..STANDARD_TIMING_START + STANDARD_TIMING_SLOTS * STANDARD_TIMING_LEN]
-        .chunks_exact(STANDARD_TIMING_LEN)
-        .position(|timing| timing == [0x01, 0x01])
+        .as_chunks::<STANDARD_TIMING_LEN>()
+        .0
+        .iter()
+        .position(|timing| *timing == [0x01, 0x01])
 }
 
 fn standard_timing_offset(raw: &[u8], slot: usize) -> Result<usize, EdidError> {
@@ -1258,7 +1297,9 @@ fn parse_established_timings(base: &[u8]) -> Vec<EstablishedTiming> {
 
 fn parse_standard_timings(base: &[u8]) -> Vec<StandardTiming> {
     base[STANDARD_TIMING_START..STANDARD_TIMING_START + STANDARD_TIMING_SLOTS * STANDARD_TIMING_LEN]
-        .chunks_exact(STANDARD_TIMING_LEN)
+        .as_chunks::<STANDARD_TIMING_LEN>()
+        .0
+        .iter()
         .enumerate()
         .filter_map(|(slot, timing)| parse_standard_timing(slot, timing[0], timing[1]))
         .collect()
@@ -1311,6 +1352,24 @@ fn parse_detailed_timing(descriptor: &[u8]) -> Option<TimingDescriptor> {
     let h_back_porch = h_blanking.saturating_sub(h_front_porch + h_sync_width);
     let v_back_porch = v_blanking.saturating_sub(v_front_porch + v_sync_width);
     let flags = descriptor[17];
+    let interlaced = flags & 0x80 != 0;
+    let (v_active, v_blanking, v_front_porch, v_sync_width, v_back_porch) = if interlaced {
+        (
+            v_active * 2,
+            v_blanking * 2 + 1,
+            v_front_porch * 2,
+            v_sync_width * 2,
+            v_back_porch * 2 + 1,
+        )
+    } else {
+        (
+            v_active,
+            v_blanking,
+            v_front_porch,
+            v_sync_width,
+            v_back_porch,
+        )
+    };
 
     Some(TimingDescriptor {
         pixel_clock_khz: u32::from(pixel_clock_10khz) * 10,
@@ -1326,8 +1385,53 @@ fn parse_detailed_timing(descriptor: &[u8]) -> Option<TimingDescriptor> {
         v_back_porch,
         h_sync_positive: flags & 0x02 != 0,
         v_sync_positive: flags & 0x04 != 0,
-        interlaced: flags & 0x80 != 0,
+        interlaced,
     })
+}
+
+pub fn cta_layout_issues(raw: &[u8]) -> Vec<String> {
+    let mut issues = Vec::new();
+    for (index, block) in raw.as_chunks::<128>().0.iter().enumerate().skip(1) {
+        if index > usize::from(raw[126]) || block[0] != CTA_TAG {
+            continue;
+        }
+        let native = usize::from(block[3] & 0x0f);
+        if block[2] == 0 {
+            if native != 0 {
+                issues.push(format!(
+                    "CTA extension {index} has native DTDs but no DTD region"
+                ));
+            }
+            continue;
+        }
+        let Some(range) = cta_dtd_range(block) else {
+            issues.push(format!("CTA extension {index} has an invalid DTD offset"));
+            continue;
+        };
+        let mut count = 0;
+        let mut end = range.start;
+        for descriptor in block[range.clone()].as_chunks::<DTD_LEN>().0 {
+            if descriptor[0] == 0 && descriptor[1] == 0 {
+                break;
+            }
+            count += 1;
+            end += DTD_LEN;
+        }
+        if block[end..BLOCK_CHECKSUM_INDEX]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            issues.push(format!(
+                "CTA extension {index} contains nonzero DTD padding"
+            ));
+        }
+        if native > count {
+            issues.push(format!(
+                "CTA extension {index} native DTD count exceeds its {count} timings"
+            ));
+        }
+    }
+    issues
 }
 
 #[cfg(test)]
@@ -1495,7 +1599,12 @@ mod tests {
                     assert_eq!(raw[index], before[index]);
                 }
             }
-            assert!(raw.chunks_exact(128).all(block_checksum_valid));
+            assert!(
+                raw.as_chunks::<128>()
+                    .0
+                    .iter()
+                    .all(|block| block_checksum_valid(block))
+            );
             assert_eq!(clear_detailed_timing_stereo(&mut raw), 0);
         }
     }
@@ -1526,7 +1635,12 @@ mod tests {
 
         assert_eq!(clear_detailed_timing_stereo(&mut raw), 0);
         assert_eq!(raw, before);
-        assert!(raw.chunks_exact(EDID_BLOCK_LEN).all(block_checksum_valid));
+        assert!(
+            raw.as_chunks::<EDID_BLOCK_LEN>()
+                .0
+                .iter()
+                .all(|block| block_checksum_valid(block))
+        );
     }
 
     #[test]
@@ -1821,6 +1935,108 @@ mod tests {
     }
 
     #[test]
+    fn interlaced_dtd_uses_frame_geometry_and_round_trips_field_bytes() {
+        let bytes = [
+            0x01, 0x1d, 0x80, 0x18, 0x71, 0x1c, 0x16, 0x20, 0x58, 0x2c, 0x25, 0, 0, 0, 0, 0, 0,
+            0x9e,
+        ];
+        let timing = parse_detailed_timing(&bytes).unwrap();
+        assert_eq!((timing.v_active, timing.v_blanking), (1080, 45));
+        assert_eq!(
+            (
+                timing.v_front_porch,
+                timing.v_sync_width,
+                timing.v_back_porch
+            ),
+            (4, 10, 31)
+        );
+        assert_eq!(timing.hyprland_mode(), "1920x1080@60.00");
+        assert_eq!(encode_detailed_timing(&timing).unwrap(), bytes);
+        assert!(
+            crate::validation::validate_timing(&timing)
+                .iter()
+                .all(|warning| warning.label() != "Error")
+        );
+        let mut invalid = timing;
+        invalid.v_active = 1081;
+        assert!(matches!(
+            encode_detailed_timing(&invalid),
+            Err(EdidError::InvalidInterlacedTiming(_))
+        ));
+    }
+
+    #[test]
+    fn interlaced_sd_timings_preserve_the_half_line_and_field_rate() {
+        for (height, blanking, hblank, front, back, rate) in [
+            (480, 45, 138, 8, 31, 59.94005994),
+            (576, 49, 144, 8, 35, 50.0),
+        ] {
+            let timing = TimingDescriptor {
+                pixel_clock_khz: 13_500,
+                h_active: 720,
+                h_blanking: hblank,
+                h_front_porch: 16,
+                h_sync_width: 62,
+                h_back_porch: hblank - 78,
+                v_active: height,
+                v_blanking: blanking,
+                v_front_porch: front,
+                v_sync_width: 6,
+                v_back_porch: back,
+                interlaced: true,
+                ..sample_timing()
+            };
+            let encoded = encode_detailed_timing(&timing).unwrap();
+            let parsed = parse_detailed_timing(&encoded).unwrap();
+            assert_eq!(parsed, timing);
+            assert!((parsed.refresh_hz().unwrap() - rate).abs() < 0.00001);
+            assert_eq!(encoded[5], (height / 2) as u8);
+        }
+    }
+
+    #[test]
+    fn cta_deletion_compacts_dtds_and_updates_only_the_native_count() {
+        let mut raw = crate::demo::monitors().unwrap().remove(0).edid.unwrap().raw;
+        raw[131] = 0xa2;
+        repair_block_checksum(&mut raw[128..256]);
+        let second = raw[155..173].to_vec();
+        let patched = delete_detailed_timing(
+            &raw,
+            DtdLocation::Cta {
+                extension_index: 1,
+                slot: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(&patched[..128], &raw[..128]);
+        assert_eq!(patched[131], 0xa1);
+        assert_eq!(&patched[137..155], second.as_slice());
+        assert!(patched[155..255].iter().all(|byte| *byte == 0));
+        assert!(cta_layout_issues(&patched).is_empty());
+        assert_eq!(
+            parse_edid(patched.clone()).unwrap().cta_blocks[0]
+                .detailed_timings
+                .len(),
+            1
+        );
+        assert!(block_checksum_valid(&patched[128..256]));
+        let mut gap = raw;
+        gap[137..155].fill(0);
+        repair_block_checksum(&mut gap[128..256]);
+        assert!(
+            cta_layout_issues(&gap)
+                .iter()
+                .any(|issue| issue.contains("nonzero DTD padding"))
+        );
+        assert!(
+            !crate::workspace::EdidWorkspace::new(gap)
+                .unwrap()
+                .validate()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn rejects_pixel_clocks_below_dtd_resolution() {
         let mut timing = sample_timing();
         timing.pixel_clock_khz = 9;
@@ -1954,8 +2170,10 @@ mod tests {
         assert_eq!(&patched[128..256], displayid.as_slice());
         assert!(
             patched
-                .chunks_exact(EDID_BLOCK_LEN)
-                .all(block_checksum_valid)
+                .as_chunks::<EDID_BLOCK_LEN>()
+                .0
+                .iter()
+                .all(|block| block_checksum_valid(block))
         );
 
         let parsed = parse_edid(patched).expect("parse expanded EDID");

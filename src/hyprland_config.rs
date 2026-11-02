@@ -601,10 +601,10 @@ fn resolve_lua_require(module: &str, including_file: &Path) -> Option<PathBuf> {
     let module_path = PathBuf::from(module.replace('.', "/"));
     let parent = including_file.parent().unwrap_or_else(|| Path::new("."));
     let mut roots = vec![parent.to_path_buf()];
-    if parent.file_name().is_some_and(|name| name == "hypr") {
-        if let Some(config_root) = parent.parent() {
-            roots.push(config_root.to_path_buf());
-        }
+    if parent.file_name().is_some_and(|name| name == "hypr")
+        && let Some(config_root) = parent.parent()
+    {
+        roots.push(config_root.to_path_buf());
     }
 
     for root in roots {
@@ -622,11 +622,11 @@ fn resolve_lua_require(module: &str, including_file: &Path) -> Option<PathBuf> {
 
 fn normalize_monitor_rule(rule: &str) -> Option<String> {
     let rule = rule.trim();
-    if let Some((key, value)) = parse_assignment(rule) {
-        if key == "monitor" {
-            return parse_monitor_rule(Path::new("<expected>"), 1, rule, value)
-                .map(|parsed| parsed.normalized_rule());
-        }
+    if let Some((key, value)) = parse_assignment(rule)
+        && key == "monitor"
+    {
+        return parse_monitor_rule(Path::new("<expected>"), 1, rule, value)
+            .map(|parsed| parsed.normalized_rule());
     }
 
     find_lua_calls(rule)
@@ -732,20 +732,20 @@ fn resolve_source_paths(
 
 fn expand_config_path(value: &str) -> String {
     let value = value.trim_matches('"').trim_matches('\'');
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest).display().to_string();
-        }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest).display().to_string();
     }
-    if let Some(rest) = value.strip_prefix("$HOME/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest).display().to_string();
-        }
+    if let Some(rest) = value.strip_prefix("$HOME/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest).display().to_string();
     }
-    if let Some(rest) = value.strip_prefix("$XDG_CONFIG_HOME/") {
-        if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-            return PathBuf::from(config_home).join(rest).display().to_string();
-        }
+    if let Some(rest) = value.strip_prefix("$XDG_CONFIG_HOME/")
+        && let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
+    {
+        return PathBuf::from(config_home).join(rest).display().to_string();
     }
     value.to_string()
 }

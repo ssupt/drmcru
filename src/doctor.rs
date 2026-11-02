@@ -118,12 +118,11 @@ fn report_text(
             }
         } else {
             lines.push("   EDID: unavailable".to_string());
-            if monitor.status != ConnectorStatus::Disconnected {
-                if let Some(path) = &monitor.drm_path {
-                    if let Err(error) = discovery::read_edid(path) {
-                        lines.push(format!("   EDID error: {error}"));
-                    }
-                }
+            if monitor.status != ConnectorStatus::Disconnected
+                && let Some(path) = &monitor.drm_path
+                && let Err(error) = discovery::read_edid(path)
+            {
+                lines.push(format!("   EDID error: {error}"));
             }
         }
 
@@ -168,19 +167,17 @@ fn report_text(
                     "   Hyprland config mode: {}",
                     last.normalized_rule()
                 ));
-                if let Some(hyprland) = &monitor.hyprland {
-                    if let Some(requested) = parse_mode_request(&last.mode) {
-                        if !hyprland
-                            .available_modes
-                            .iter()
-                            .any(|mode| available_mode_matches_request(mode, requested))
-                        {
-                            lines.push(format!(
-                                "   Hyprland config warning: requested mode {} is not currently exposed",
-                                last.mode
-                            ));
-                        }
-                    }
+                if let Some(hyprland) = &monitor.hyprland
+                    && let Some(requested) = parse_mode_request(&last.mode)
+                    && !hyprland
+                        .available_modes
+                        .iter()
+                        .any(|mode| available_mode_matches_request(mode, requested))
+                {
+                    lines.push(format!(
+                        "   Hyprland config warning: requested mode {} is not currently exposed",
+                        last.mode
+                    ));
                 }
             }
         }

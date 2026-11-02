@@ -648,6 +648,25 @@ fn push_mode_source(map: &mut BTreeMap<ModeKey, Vec<String>>, key: ModeKey, sour
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_all_cta_dtds_handles_compacted_slot_indices() {
+        let mut app = App::new(crate::demo::monitors().unwrap());
+        app.delete_all_extension_dtds();
+        let workspace = app.selected_workspace().unwrap();
+        assert!(
+            workspace
+                .cta_dtd_slots()
+                .unwrap()
+                .iter()
+                .all(|slot| slot.timing.is_none())
+        );
+        assert_eq!(workspace.dtds().unwrap().len(), 2);
+        assert!(workspace.validate().is_empty());
+        let mut app = App::new(crate::demo::monitors().unwrap());
+        app.delete_all_detailed();
+        assert!(app.selected_workspace().unwrap().dtds().unwrap().is_empty());
+    }
     use crate::edid::{DtdLocation, encode_detailed_timing, parse_edid};
     use crate::models::ConnectorStatus;
 

@@ -21,8 +21,8 @@ This release has been tested on:
 - Limine with `limine-mkinitcpio`
 
 Exported EDIDs can be installed manually on other setups. Automatic
-Install/Update/Uninstall is currently limited to Limine systems that rebuild with
-`limine-mkinitcpio` or mkinitcpio presets.
+Install/Update/Uninstall requires Limine entry-tool with its `limine-mkinitcpio`
+integration and a boot partition mounted at `/boot`.
 
 ## Install
 
@@ -34,23 +34,24 @@ yay -S drmcru-bin
 ```
 
 Download the portable x86-64 binary from the
-[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.5):
+[latest release](https://github.com/ssupt/drmcru/releases/tag/v0.1.6):
 
 ```sh
-curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.5/drmcru-0.1.5-x86_64-unknown-linux-musl
-curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.5/SHA256SUMS
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.6/drmcru-0.1.6-x86_64-unknown-linux-musl
+curl -LO https://github.com/ssupt/drmcru/releases/download/v0.1.6/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-chmod +x drmcru-0.1.5-x86_64-unknown-linux-musl
-./drmcru-0.1.5-x86_64-unknown-linux-musl doctor
-./drmcru-0.1.5-x86_64-unknown-linux-musl
+chmod +x drmcru-0.1.6-x86_64-unknown-linux-musl
+./drmcru-0.1.6-x86_64-unknown-linux-musl doctor
+./drmcru-0.1.6-x86_64-unknown-linux-musl
 ```
 
 The TUI and manual Export work on Linux systems that expose connectors through
 `/sys/class/drm`. Hyprland is optional, but `hyprctl` is required for live mode
 discovery, switching, and verification.
 
-Automatic Install/Update/Uninstall currently requires `pkexec`, Limine,
-mkinitcpio, and either `limine-mkinitcpio` or mkinitcpio presets.
+Automatic Install/Update/Uninstall requires `pkexec`, Limine entry-tool,
+`limine-mkinitcpio`, mkinitcpio, and binutils (`objcopy`). Custom preset-only
+systems can use Export.
 
 Run `drmcru` as your normal desktop user, not with `sudo`. It requests only the
 privileged Apply/Uninstall step through `pkexec`; running the whole TUI as root
@@ -58,7 +59,7 @@ can hide the active Hyprland session and create root-owned exports.
 
 ## Build From Source
 
-Rust 1.87 or newer is required.
+Rust 1.88 or newer is required.
 
 ```sh
 git clone https://github.com/ssupt/drmcru.git
@@ -143,34 +144,53 @@ On the supported Limine/mkinitcpio path, Install/Update modifies:
 - `/lib/firmware/edid/<name>.bin`
 - `/etc/mkinitcpio.conf.d/20-drmcru.conf`
 - `/boot/limine.conf`
-- `/etc/limine-entry-tool.d/drmcru-edid.conf` when `limine-mkinitcpio` is used
+- `/etc/limine-entry-tool.d/drmcru-edid.conf` (managed mapping state)
+- `/etc/default/limine` (a marked block of effective kernel command lines)
+- `/boot/drmcru-recovery` (the previous boot entry's kernel and images)
 
-It writes collision-resistant `.drmcru.*.bak` backups before editing config and
-firmware files. Existing overrides for other connectors are retained in the same
-kernel parameter. If an install or rebuild step fails, the script restores all
-files changed by that run.
+It backs up configuration, firmware and the entire boot partition before making
+changes. Every installed kernel and configured or existing fallback image is
+built in a private staging directory. Before updating boot entries, drmcru checks
+the embedded firmware and UKI command lines. Failures restore the tracked
+configuration, firmware and boot partition, including partially replaced images.
+Configuration and firmware also have timestamped `.drmcru.*.bak` backups.
+
+Existing root, encryption and per-kernel arguments are preserved. Overrides from
+other Limine files are consolidated into one EDID parameter per command line.
+The managed block follows user settings in `/etc/default/limine` so later appends
+cannot undo that consolidation. Update refreshes it after changes to the
+underlying command-line sources; Uninstall removes it when no longer needed.
+Connector mappings that would also match another connector are rejected.
 
 The mkinitcpio drop-in appends EDID paths with `FILES+=(...)`, preserving existing
 files and overrides for other monitors. Install/Update migrates this monitor's
 legacy entry from `/etc/mkinitcpio.conf` when present. Uninstall removes its entry
 and deletes the drmcru drop-in when no overrides remain.
 
-Automatic Apply requires mkinitcpio to read its default configuration and
-drop-ins. Presets with explicit `*_config` assignments disable drop-ins and are
-rejected when using `mkinitcpio -P`. Custom Limine UKI options must also avoid
-`-c`/`--config`. Export includes instructions for configuring those systems
-manually.
+Automatic Apply uses mkinitcpio's default configuration and drop-ins, building
+each image directly rather than relying on the rebuild wrapper's exit status.
+Custom UKI options that can override the verified output or command line are
+rejected. Export includes instructions for configuring other systems manually.
 
 ## Recovery
 
 If a custom mode is unusable but the desktop remains accessible, switch back
 to a known-good mode, choose Uninstall in `drmcru`, and reboot.
 
-If the graphical session is unusable, boot once without the
+The Limine menu retains a **drmcru recovery (before last change)** entry with
+copies of the previous kernel and images. Select it if the new override prevents
+normal startup. It represents the state before the most recent successful Apply
+or Uninstall, rather than a guaranteed known-good configuration.
+
+If the graphical session is unusable, you can also boot once without the
 `drm.edid_firmware=...` parameter using the Limine entry editor or another boot
 entry. Then run `drmcru`, choose Uninstall, and reboot. Changed configuration
 files have timestamped backups beside the originals, including the main
 `mkinitcpio.conf` when migrating a legacy installation.
+
+If a failure reports incomplete recovery, keep the reported recovery directory
+and repair the boot partition before rebooting. Automatic installation requires
+space for staged images, a complete boot backup and the retained recovery entry.
 
 ## First-run troubleshooting
 
