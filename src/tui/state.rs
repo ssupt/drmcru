@@ -616,6 +616,7 @@ impl DetailedResolutionEditor {
             EditorField::Interlaced => {
                 self.preset = TimingPreset::Manual;
                 self.interlaced = !self.interlaced;
+                self.update_rate_fields_from_pixel_clock(EditorField::Interlaced);
             }
             _ => return false,
         }
@@ -730,8 +731,9 @@ impl DetailedResolutionEditor {
             return;
         }
 
-        let pixel_clock_khz =
-            (f64::from(h_total) * f64::from(v_total) * refresh_hz / 1000.0).round() as u32;
+        let pixel_clock_khz = (f64::from(h_total) * f64::from(v_total) * refresh_hz
+            / if self.interlaced { 2000.0 } else { 1000.0 })
+        .round() as u32;
         self.pixel_clock.set(pixel_clock_khz.to_string());
         self.h_rate.set(format!(
             "{:.3}",
@@ -821,7 +823,8 @@ impl DetailedResolutionEditor {
         self.pixel_clock.set(pixel_clock_khz.to_string());
         self.refresh_hint.set(format!(
             "{:.3}",
-            f64::from(pixel_clock_khz) * 1000.0 / (f64::from(h_total) * f64::from(v_total))
+            f64::from(pixel_clock_khz) * if self.interlaced { 2000.0 } else { 1000.0 }
+                / (f64::from(h_total) * f64::from(v_total))
         ));
     }
 
@@ -845,7 +848,8 @@ impl DetailedResolutionEditor {
         if edited_field != EditorField::Refresh {
             self.refresh_hint.set(format!(
                 "{:.3}",
-                f64::from(pixel_clock_khz) * 1000.0 / (f64::from(h_total) * f64::from(v_total))
+                f64::from(pixel_clock_khz) * if self.interlaced { 2000.0 } else { 1000.0 }
+                    / (f64::from(h_total) * f64::from(v_total))
             ));
         }
     }
@@ -1228,6 +1232,54 @@ fn next_char_boundary(value: &str, cursor: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interlaced_editor_and_exact_preset_use_frame_height_and_field_rate() {
+        let timing = TimingDescriptor {
+            pixel_clock_khz: 74_250,
+            h_active: 1920,
+            h_blanking: 280,
+            h_front_porch: 88,
+            h_sync_width: 44,
+            h_back_porch: 148,
+            v_active: 1080,
+            v_blanking: 45,
+            v_front_porch: 4,
+            v_sync_width: 10,
+            v_back_porch: 31,
+            h_sync_positive: true,
+            v_sync_positive: true,
+            interlaced: true,
+        };
+        let mut editor = DetailedResolutionEditor::from_timing(timing.clone(), EditorMode::Add);
+        assert_eq!(editor.input(EditorField::Height).buffer, "1080");
+        assert_eq!(editor.input(EditorField::Refresh).buffer, "60.00");
+        editor.set_pixel_clock_from_refresh();
+        assert_eq!(editor.timing().unwrap(), timing);
+        editor.input_mut(EditorField::Refresh).set("50.00".into());
+        editor.set_pixel_clock_from_refresh();
+        assert_eq!(editor.timing().unwrap().pixel_clock_khz, 61_875);
+        editor.preset = TimingPreset::Exact;
+        assert!((editor.timing().unwrap().refresh_hz().unwrap() - 50.0).abs() < 0.001);
+        editor.toggle_field(EditorField::Interlaced);
+        assert_eq!(
+            editor
+                .input(EditorField::Refresh)
+                .buffer
+                .parse::<f64>()
+                .unwrap(),
+            25.0
+        );
+        editor.toggle_field(EditorField::Interlaced);
+        assert_eq!(
+            editor
+                .input(EditorField::Refresh)
+                .buffer
+                .parse::<f64>()
+                .unwrap(),
+            50.0
+        );
+    }
 
     #[test]
     fn text_paths_preserve_commas_while_refresh_accepts_decimal_commas() {

@@ -634,7 +634,7 @@ impl App {
             self.status = "No detailed timings to delete.".to_string();
             return;
         }
-        for location in locations {
+        for location in locations.into_iter().rev() {
             if let Some(workspace) = self.selected_workspace_mut() {
                 let _ = workspace.delete_dtd(location);
             }
@@ -659,7 +659,7 @@ impl App {
         }
 
         let mut deleted = 0usize;
-        for location in locations {
+        for location in locations.into_iter().rev() {
             if let Some(workspace) = self.selected_workspace_mut()
                 && workspace.delete_dtd(location).is_ok()
             {
@@ -1463,6 +1463,15 @@ impl App {
             return;
         };
         let monitor = monitor.clone();
+        if let Err(error) = install::validate_connector_mapping(
+            &monitor.connector,
+            self.monitors
+                .iter()
+                .map(|monitor| monitor.connector.as_str()),
+        ) {
+            self.status = error;
+            return;
+        }
         let override_status = self.selected_override_status().cloned();
         let operation = if override_status
             .as_ref()

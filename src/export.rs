@@ -65,6 +65,7 @@ pub fn export_instructions(edid_path: &Path, plan: &ExportPlan) -> String {
         String::new(),
         "3. Add this kernel parameter to your bootloader:".to_string(),
         format!("   {}", plan.drm_kernel_parameter()),
+        "   Check connector names first: Linux prefix matching makes DP-1 also match DP-10 and DP-1-1. Do not install an ambiguous mapping.".to_string(),
         String::new(),
         "4. Add or update this Hyprland monitor rule:".to_string(),
         format!("   {}", plan.hyprland_monitor_rule()),

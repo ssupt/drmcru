@@ -261,6 +261,7 @@ pub struct TimingDescriptor {
     pub h_front_porch: u16,
     pub h_sync_width: u16,
     pub h_back_porch: u16,
+    /// Vertical geometry is in full-frame lines, including for interlaced modes.
     pub v_active: u16,
     pub v_blanking: u16,
     pub v_front_porch: u16,
@@ -272,6 +273,31 @@ pub struct TimingDescriptor {
 }
 
 impl TimingDescriptor {
+    /// Convert full-frame geometry to the per-field values stored in EDID DTDs.
+    pub fn edid_vertical_fields(&self) -> Result<[u16; 5], &'static str> {
+        let values = [
+            self.v_active,
+            self.v_blanking,
+            self.v_front_porch,
+            self.v_sync_width,
+            self.v_back_porch,
+        ];
+        if !self.interlaced {
+            return Ok(values);
+        }
+        if !self.v_active.is_multiple_of(2)
+            || !self.v_front_porch.is_multiple_of(2)
+            || !self.v_sync_width.is_multiple_of(2)
+            || self.v_blanking % 2 != 1
+            || self.v_back_porch % 2 != 1
+        {
+            return Err(
+                "interlaced DTDs require even frame height, front porch and sync width, and odd blanking/back porch for the half-line",
+            );
+        }
+        Ok(values.map(|value| value / 2))
+    }
+
     pub fn h_total(&self) -> u16 {
         self.h_active.saturating_add(self.h_blanking)
     }
@@ -296,7 +322,8 @@ impl TimingDescriptor {
             return None;
         }
 
-        Some((f64::from(self.pixel_clock_khz) * 1000.0) / f64::from(h_total * v_total))
+        let scan = if self.interlaced { 2.0 } else { 1.0 };
+        Some((f64::from(self.pixel_clock_khz) * 1000.0 * scan) / f64::from(h_total * v_total))
     }
 
     pub fn hyprland_mode(&self) -> String {

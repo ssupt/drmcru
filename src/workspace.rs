@@ -279,6 +279,11 @@ impl EdidWorkspace {
 
     pub fn validate(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
+        issues.extend(
+            crate::edid::cta_layout_issues(&self.working.raw)
+                .into_iter()
+                .map(|message| ValidationIssue { message }),
+        );
         let expected_len = (usize::from(self.working.extension_blocks) + 1) * 128;
         if self.working.raw.len() != expected_len {
             issues.push(ValidationIssue {
