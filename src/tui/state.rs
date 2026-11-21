@@ -255,7 +255,7 @@ impl DetailedResolutionEditor {
         }
 
         let request = self.preset_request()?;
-        Ok(timing_for_preset(self.preset, request, Some(&manual)))
+        timing_for_preset(self.preset, request, Some(&manual))
     }
 
     pub(super) fn manual_timing(&self) -> Result<TimingDescriptor, &'static str> {
@@ -320,6 +320,7 @@ impl DetailedResolutionEditor {
             width,
             height,
             refresh_hz,
+            interlaced: self.interlaced,
         })
     }
 
@@ -692,7 +693,9 @@ impl DetailedResolutionEditor {
             return;
         };
         let current = self.manual_timing().ok();
-        let timing = timing_for_preset(self.preset, request, current.as_ref());
+        let Ok(timing) = timing_for_preset(self.preset, request, current.as_ref()) else {
+            return;
+        };
         self.set_timing_fields(&timing);
         self.refresh_hint.set(format!("{:.2}", request.refresh_hz));
     }
@@ -1290,7 +1293,9 @@ mod tests {
             width: 1920,
             height: 1080,
             refresh_hz: 60.0,
-        });
+            interlaced: false,
+        })
+        .unwrap();
         let mut editor = DetailedResolutionEditor::from_timing(timing, EditorMode::Add);
         editor.active_field = EditorField::Refresh;
         editor.input_mut(EditorField::Refresh).set("60".to_string());
@@ -1305,7 +1310,9 @@ mod tests {
             width: 1920,
             height: 1080,
             refresh_hz: 60.0,
-        });
+            interlaced: false,
+        })
+        .unwrap();
         let mut editor = DetailedResolutionEditor::from_timing(timing, EditorMode::Add);
         for field in [
             EditorField::Width,
