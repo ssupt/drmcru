@@ -233,7 +233,7 @@ fn positive(value: i64) -> bool {
 impl Calc {
     fn new(request: CvtRequest, current: Option<&TimingDescriptor>) -> Result<Self, &'static str> {
         let refresh_millihz = request.refresh_hz * 1000.0;
-        if !refresh_millihz.is_finite() || refresh_millihz < 0.0 || refresh_millihz > 1e15 {
+        if !(0.0..=1e15).contains(&refresh_millihz) {
             return Err("invalid refresh");
         }
         let (reset_h_polarity, reset_v_polarity) = current
