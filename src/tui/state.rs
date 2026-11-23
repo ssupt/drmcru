@@ -255,7 +255,7 @@ impl DetailedResolutionEditor {
         }
 
         let request = self.preset_request()?;
-        Ok(timing_for_preset(self.preset, request, Some(&manual)))
+        timing_for_preset(self.preset, request, Some(&manual))
     }
 
     pub(super) fn manual_timing(&self) -> Result<TimingDescriptor, &'static str> {
@@ -320,6 +320,7 @@ impl DetailedResolutionEditor {
             width,
             height,
             refresh_hz,
+            interlaced: self.interlaced,
         })
     }
 
@@ -692,9 +693,10 @@ impl DetailedResolutionEditor {
             return;
         };
         let current = self.manual_timing().ok();
-        let timing = timing_for_preset(self.preset, request, current.as_ref());
+        let Ok(timing) = timing_for_preset(self.preset, request, current.as_ref()) else {
+            return;
+        };
         self.set_timing_fields(&timing);
-        self.refresh_hint.set(format!("{:.2}", request.refresh_hz));
     }
 
     pub(super) fn set_timing_fields(&mut self, timing: &TimingDescriptor) {
@@ -1234,6 +1236,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preset_edits_preserve_requested_refresh_and_saved_geometry() {
+        let initial = crate::timings::cvt_reduced_blanking(CvtRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+            interlaced: false,
+        })
+        .unwrap();
+
+        for (preset, refresh) in [
+            (TimingPreset::ExactReduced, "59.999"),
+            (TimingPreset::AutomaticPc, "60.501"),
+            (TimingPreset::CvtStandard, "75.001"),
+            (TimingPreset::ExactReduced, "59.9995"),
+        ] {
+            for edit_refresh in [false, true] {
+                let mut editor =
+                    DetailedResolutionEditor::from_timing(initial.clone(), EditorMode::Add);
+                editor.input_mut(EditorField::Refresh).set(refresh.into());
+                let expected =
+                    timing_for_preset(preset, editor.preset_request().unwrap(), Some(&initial))
+                        .unwrap();
+
+                if edit_refresh {
+                    editor.preset = preset;
+                    editor.after_text_edit(EditorField::Refresh);
+                } else {
+                    let index = TimingPreset::ALL
+                        .iter()
+                        .position(|candidate| *candidate == preset)
+                        .unwrap();
+                    editor.cycle_preset(index as isize);
+                }
+
+                assert_eq!(editor.input(EditorField::Refresh).buffer, refresh);
+                assert_eq!(editor.manual_timing().unwrap(), expected);
+                assert_eq!(editor.timing().unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn typing_fractional_refresh_in_a_preset_preserves_the_input() {
+        let initial = crate::timings::cvt_reduced_blanking(CvtRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+            interlaced: false,
+        })
+        .unwrap();
+        let mut editor = DetailedResolutionEditor::from_timing(initial, EditorMode::Add);
+        editor.preset = TimingPreset::ExactReduced;
+        editor.active_field = EditorField::Refresh;
+        editor.input_mut(EditorField::Refresh).set(String::new());
+        for character in "59.999".chars() {
+            editor.insert_char(character);
+        }
+
+        assert_eq!(editor.input(EditorField::Refresh).buffer, "59.999");
+        assert_eq!(editor.timing().unwrap(), editor.manual_timing().unwrap());
+        assert_eq!(editor.timing().unwrap().pixel_clock_khz, 140_400);
+        assert_eq!(editor.timing().unwrap().v_total(), 1125);
+    }
+
+    #[test]
     fn interlaced_editor_and_exact_preset_use_frame_height_and_field_rate() {
         let timing = TimingDescriptor {
             pixel_clock_khz: 74_250,
@@ -1290,7 +1357,9 @@ mod tests {
             width: 1920,
             height: 1080,
             refresh_hz: 60.0,
-        });
+            interlaced: false,
+        })
+        .unwrap();
         let mut editor = DetailedResolutionEditor::from_timing(timing, EditorMode::Add);
         editor.active_field = EditorField::Refresh;
         editor.input_mut(EditorField::Refresh).set("60".to_string());
@@ -1305,7 +1374,9 @@ mod tests {
             width: 1920,
             height: 1080,
             refresh_hz: 60.0,
-        });
+            interlaced: false,
+        })
+        .unwrap();
         let mut editor = DetailedResolutionEditor::from_timing(timing, EditorMode::Add);
         for field in [
             EditorField::Width,

@@ -211,7 +211,9 @@ impl App {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 144.0,
-            }),
+                interlaced: false,
+            })
+            .expect("CVT-RB timing for 2560x1440@144 is valid"),
             detailed_clipboard: None,
             detailed_editor: None,
             standard_editor: None,
