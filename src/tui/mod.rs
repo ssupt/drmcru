@@ -832,20 +832,33 @@ mod tests {
     #[test]
     fn cta_delete_keeps_selection_after_video_rows() {
         let mut app = App::new(vec![monitor_with_cta_dtd()]);
-        let location = DtdLocation::Cta {
-            extension_index: 1,
-            slot: 5,
-        };
         app.selected_workspace_mut()
             .unwrap()
-            .add_cta_dtd_at(location, timing())
+            .add_cta_dtd(1, timing())
             .unwrap();
-        app.selected_extension = Some(6);
+        app.selected_extension = Some(2);
         app.delete_selected_extension_dtd();
-        assert_eq!(app.selected_extension, Some(6));
+        assert_eq!(app.selected_extension, Some(2));
         assert!(
-            matches!(&app.working_extension_rows()[6], ExtensionRow::Dtd(row) if row.slot == 5 && row.timing.is_none())
+            matches!(&app.working_extension_rows()[2], ExtensionRow::Dtd(row) if row.slot == 1 && row.timing.is_none())
         );
+        assert!(app.selected_workspace().unwrap().validate().is_empty());
+    }
+
+    #[test]
+    fn adding_on_later_free_cta_slot_inserts_contiguously_and_stays_valid() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        // Select a non-first free CTA slot (slot 4, after video row 0 and occupied slot 0).
+        app.selected_extension = Some(5);
+        app.open_extension_add_editor();
+        app.apply_detailed_editor();
+
+        let workspace = app.selected_workspace().unwrap();
+        assert!(workspace.validate().is_empty());
+        let slots = workspace.cta_dtd_slots().unwrap();
+        assert!(slots[0].timing.is_some());
+        assert!(slots[1].timing.is_some());
+        assert!(slots[4].timing.is_none());
     }
 
     #[test]

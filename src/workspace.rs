@@ -62,6 +62,8 @@ pub struct ValidationIssue {
 pub enum WorkspaceError {
     #[error("failed to parse EDID: {0}")]
     Edid(#[from] EdidError),
+    #[error("no original monitor EDID to reset to")]
+    NoOriginalEdid,
 }
 
 impl EdidWorkspace {
@@ -120,45 +122,6 @@ impl EdidWorkspace {
     ) -> Result<DtdLocation, WorkspaceError> {
         let (raw, location) =
             insert_cta_detailed_timing(&self.working.raw, extension_index, &timing)?;
-        self.replace_working_raw(raw)?;
-        self.operations
-            .push(WorkspaceOperation::AddDtd { location, timing });
-        Ok(location)
-    }
-
-    pub fn add_cta_dtd_at(
-        &mut self,
-        location: DtdLocation,
-        timing: TimingDescriptor,
-    ) -> Result<DtdLocation, WorkspaceError> {
-        let (extension_index, slot) = match location {
-            DtdLocation::Cta {
-                extension_index,
-                slot,
-            } => (extension_index, slot),
-            DtdLocation::Base { slot } => {
-                return Err(WorkspaceError::Edid(EdidError::InvalidDetailedTimingSlot(
-                    slot,
-                )));
-            }
-        };
-
-        let slots = cta_dtd_slots(&self.working.raw)?;
-        let Some(row) = slots
-            .iter()
-            .find(|row| row.extension_index == extension_index && row.slot == slot)
-        else {
-            return Err(WorkspaceError::Edid(EdidError::InvalidDetailedTimingSlot(
-                slot,
-            )));
-        };
-        if row.timing.is_some() || row.occupied_unknown {
-            return Err(WorkspaceError::Edid(
-                EdidError::NoAvailableDetailedTimingSlot,
-            ));
-        }
-
-        let raw = patch_detailed_timing(&self.working.raw, location, &timing)?;
         self.replace_working_raw(raw)?;
         self.operations
             .push(WorkspaceOperation::AddDtd { location, timing });
@@ -243,6 +206,9 @@ impl EdidWorkspace {
     }
 
     pub fn reset(&mut self) -> Result<(), WorkspaceError> {
+        if self.original_raw.is_empty() {
+            return Err(WorkspaceError::NoOriginalEdid);
+        }
         self.working = parse_edid(self.original_raw.clone())?;
         self.operations.clear();
         self.operations.push(WorkspaceOperation::Reset);
@@ -658,31 +624,43 @@ mod tests {
     }
 
     #[test]
-    fn add_cta_dtd_at_targets_exact_free_slot() {
+    fn add_cta_dtd_packs_contiguously_and_passes_validation() {
         let mut edid = minimal_base_edid(1);
         edid.extend(cta_extension());
         let mut workspace = EdidWorkspace::new(edid).expect("workspace");
 
-        let location = workspace
-            .add_cta_dtd_at(
-                DtdLocation::Cta {
-                    extension_index: 1,
-                    slot: 2,
-                },
-                sample_timing(),
-            )
-            .expect("add exact CTA DTD");
+        let first = workspace
+            .add_cta_dtd(1, sample_timing())
+            .expect("add first CTA DTD");
+        let second = workspace
+            .add_cta_dtd(1, alternate_timing())
+            .expect("add second CTA DTD");
 
         assert_eq!(
-            location,
+            first,
             DtdLocation::Cta {
                 extension_index: 1,
-                slot: 2
+                slot: 0
             }
         );
-        let slots = workspace.cta_dtd_slots().expect("CTA DTD slots");
-        assert!(slots[2].timing.is_some());
-        assert!(slots[0].timing.is_none());
+        assert_eq!(
+            second,
+            DtdLocation::Cta {
+                extension_index: 1,
+                slot: 1
+            }
+        );
+        assert!(workspace.validate().is_empty());
+    }
+
+    #[test]
+    fn imported_workspace_without_original_reports_no_original_on_reset() {
+        let mut workspace =
+            EdidWorkspace::imported(minimal_base_edid(0), "/tmp/imported.bin").unwrap();
+        assert!(matches!(
+            workspace.reset(),
+            Err(WorkspaceError::NoOriginalEdid)
+        ));
     }
 
     #[test]

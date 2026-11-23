@@ -24,7 +24,6 @@ pub(super) enum EditorMode {
     Add,
     AddCta {
         extension_index: u8,
-        slot: Option<usize>,
     },
     Edit {
         index: usize,

@@ -500,10 +500,7 @@ impl App {
             return;
         };
 
-        self.open_detailed_editor(EditorMode::AddCta {
-            extension_index,
-            slot: Some(slot),
-        });
+        self.open_detailed_editor(EditorMode::AddCta { extension_index });
         self.status =
             format!("Adding detailed timing to CTA-861 extension {extension_index} slot {slot}.");
     }
@@ -791,26 +788,13 @@ impl App {
                 };
                 workspace.add_dtd(timing.clone())
             }
-            EditorMode::AddCta {
-                extension_index,
-                slot,
-            } => {
+            EditorMode::AddCta { extension_index } => {
                 let Some(workspace) = self.selected_workspace_mut() else {
                     self.status =
                         "Cannot apply: selected monitor has no readable EDID.".to_string();
                     return;
                 };
-                if let Some(slot) = slot {
-                    workspace.add_cta_dtd_at(
-                        DtdLocation::Cta {
-                            extension_index,
-                            slot,
-                        },
-                        timing.clone(),
-                    )
-                } else {
-                    workspace.add_cta_dtd(extension_index, timing.clone())
-                }
+                workspace.add_cta_dtd(extension_index, timing.clone())
             }
             EditorMode::Edit { location, index } => {
                 let Some(workspace) = self.selected_workspace_mut() else {
@@ -1173,21 +1157,28 @@ impl App {
     }
 
     fn selected_or_first_free_cta_slot(&self) -> Option<(u8, usize)> {
-        if let Some(row) = self.selected_extension_slot()
-            && row.timing.is_none()
-            && !row.occupied_unknown
+        let preferred_extension = match self.selected_extension_row() {
+            Some(ExtensionRow::Dtd(row)) => Some(row.extension_index),
+            Some(ExtensionRow::Video {
+                extension_index, ..
+            }) => Some(extension_index),
+            _ => None,
+        };
+        let slots = self.working_cta_dtd_slots();
+        if let Some(extension_index) = preferred_extension
+            && let Some(row) = slots.iter().find(|row| {
+                row.extension_index == extension_index
+                    && row.timing.is_none()
+                    && !row.occupied_unknown
+            })
         {
             return Some((row.extension_index, row.slot));
         }
 
-        self.working_extension_rows()
+        slots
             .into_iter()
-            .find_map(|row| match row {
-                ExtensionRow::Dtd(row) if row.timing.is_none() && !row.occupied_unknown => {
-                    Some((row.extension_index, row.slot))
-                }
-                _ => None,
-            })
+            .find(|row| row.timing.is_none() && !row.occupied_unknown)
+            .map(|row| (row.extension_index, row.slot))
     }
 
     fn selected_switch_mode(&self) -> Option<SwitchModeCandidate> {
