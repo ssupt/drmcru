@@ -11,15 +11,18 @@ use super::{
 use crate::workspace::format_location;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use std::collections::BTreeMap;
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>) {
         self.hitboxes.clear();
+        let provenance = self.mode_provenance_map();
 
+        let status_height = if frame.area().height >= 26 { 3 } else { 2 };
         let [top_bar, main_area, status_bar, bottom_bar] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(16),
-            Constraint::Length(2),
+            Constraint::Length(status_height),
             Constraint::Length(3),
         ])
         .areas(frame.area());
@@ -47,10 +50,10 @@ impl App {
             .areas(main_area);
             (established, detailed, standard, extension)
         };
-        self.draw_established_panel(frame, established);
-        self.draw_resolution_section(frame, detailed, ResolutionSection::Detailed);
-        self.draw_resolution_section(frame, standard, ResolutionSection::Standard);
-        self.draw_resolution_section(frame, extension, ResolutionSection::Extension);
+        self.draw_established_panel(frame, established, &provenance);
+        self.draw_resolution_section(frame, detailed, ResolutionSection::Detailed, &provenance);
+        self.draw_resolution_section(frame, standard, ResolutionSection::Standard, &provenance);
+        self.draw_resolution_section(frame, extension, ResolutionSection::Extension, &provenance);
 
         frame.render_widget(
             Paragraph::new(self.status.as_str())
@@ -176,7 +179,12 @@ impl App {
         format!("Live: {width}x{height}@{refresh:.2}")
     }
 
-    fn draw_established_panel(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_established_panel(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        provenance: &BTreeMap<ModeKey, Vec<String>>,
+    ) {
         let inner = inner_rect(area);
         let len = self
             .selected_edid()
@@ -228,7 +236,7 @@ impl App {
                     timing.width,
                     timing.height,
                     timing.refresh_hz,
-                    self.provenance_suffix(key)
+                    provenance_suffix(provenance, key)
                 );
                 frame.render_widget(Paragraph::new(text).style(row_style(selected)), row);
                 self.push_hitbox(row, HitTarget::EstablishedRow(index), 0);
@@ -241,6 +249,7 @@ impl App {
         frame: &mut Frame<'_>,
         area: Rect,
         section: ResolutionSection,
+        provenance: &BTreeMap<ModeKey, Vec<String>>,
     ) {
         let show_buttons = area.height >= 8 && area.width >= 58;
         let [list_area, buttons_area] = Layout::vertical([
@@ -274,10 +283,10 @@ impl App {
         );
 
         match section {
-            ResolutionSection::Detailed => self.draw_detailed_rows(frame, inner),
-            ResolutionSection::Standard => self.draw_standard_rows(frame, inner),
+            ResolutionSection::Detailed => self.draw_detailed_rows(frame, inner, provenance),
+            ResolutionSection::Standard => self.draw_standard_rows(frame, inner, provenance),
             ResolutionSection::Extension => {
-                self.draw_extension_rows(frame, inner);
+                self.draw_extension_rows(frame, inner, provenance);
             }
         }
 
@@ -286,7 +295,12 @@ impl App {
         }
     }
 
-    fn draw_detailed_rows(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_detailed_rows(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        provenance: &BTreeMap<ModeKey, Vec<String>>,
+    ) {
         let rows = self.working_dtds();
         if rows.is_empty() {
             frame.render_widget(Paragraph::new("No detailed timings."), area);
@@ -308,7 +322,7 @@ impl App {
             };
             let selected = self.selected_detailed == Some(index);
             let suffix = ModeKey::from_timing(&row.timing)
-                .map(|key| self.provenance_suffix(key))
+                .map(|key| provenance_suffix(provenance, key))
                 .unwrap_or_default();
             let text = format!(
                 "{} {:<18} {}{}",
@@ -322,7 +336,12 @@ impl App {
         }
     }
 
-    fn draw_standard_rows(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_standard_rows(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        provenance: &BTreeMap<ModeKey, Vec<String>>,
+    ) {
         let rows = self.working_standard_timings();
         if rows.is_empty() {
             frame.render_widget(Paragraph::new("No standard timings."), area);
@@ -357,14 +376,19 @@ impl App {
                 row.timing.height,
                 row.timing.refresh_hz,
                 row.timing.aspect.label(),
-                self.provenance_suffix(key)
+                provenance_suffix(provenance, key)
             );
             frame.render_widget(Paragraph::new(text).style(row_style(selected)), rect);
             self.push_hitbox(rect, HitTarget::StandardRow(index), 0);
         }
     }
 
-    fn draw_extension_rows(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_extension_rows(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        provenance: &BTreeMap<ModeKey, Vec<String>>,
+    ) {
         let mut y = area.y;
         let header_count = self.extension_header_count(area.height);
         if let Some(edid) = self.selected_edid() {
@@ -469,13 +493,15 @@ impl App {
                         extension_index,
                         descriptor.label(),
                         match descriptor {
-                            crate::models::CtaVideoDescriptor::Known(mode) => self
-                                .provenance_suffix(ModeKey::new(
+                            crate::models::CtaVideoDescriptor::Known(mode) => provenance_suffix(
+                                provenance,
+                                ModeKey::new(
                                     mode.width,
                                     mode.height,
                                     mode.refresh_hz(),
                                     mode.interlaced,
-                                )),
+                                ),
+                            ),
                             crate::models::CtaVideoDescriptor::Unknown { .. } => String::new(),
                         }
                     ),
@@ -484,7 +510,7 @@ impl App {
                             (
                                 timing.hyprland_mode(),
                                 ModeKey::from_timing(timing)
-                                    .map(|key| self.provenance_suffix(key))
+                                    .map(|key| provenance_suffix(provenance, key))
                                     .unwrap_or_default(),
                             )
                         } else if row.occupied_unknown {
@@ -504,7 +530,7 @@ impl App {
                     }
                     ExtensionRow::DisplayIdDtd(row) => {
                         let suffix = ModeKey::from_timing(&row.timing)
-                            .map(|key| self.provenance_suffix(key))
+                            .map(|key| provenance_suffix(provenance, key))
                             .unwrap_or_default();
                         format!(
                             "{}   DisplayID ext {} DTD {}  {:<18}{}{}",
@@ -1289,6 +1315,15 @@ impl App {
             .filter(|hitbox| super::support::rect_contains(hitbox.rect, x, y))
             .max_by_key(|hitbox| hitbox.z)
             .copied()
+    }
+}
+
+fn provenance_suffix(provenance: &BTreeMap<ModeKey, Vec<String>>, key: ModeKey) -> String {
+    let count = provenance.get(&key).map_or(0, Vec::len);
+    if count > 1 {
+        format!("  [{count} sources]")
+    } else {
+        String::new()
     }
 }
 

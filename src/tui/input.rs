@@ -1,10 +1,25 @@
 use super::state::{EditorMode, ModalButton, StandardEditorMode};
 use super::{App, FocusArea, GlobalAction, HitTarget, Hitbox, ResolutionSection, SectionAction};
 use crate::workspace::MoveDirection;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+fn is_ctrl_c(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+}
+
+fn has_command_modifier(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
 
 impl App {
     pub(super) fn handle_main_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return matches!(key.code, KeyCode::Char('c' | 'C' | 'q' | 'Q'));
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return true,
             KeyCode::Tab => self.next_focus(),
@@ -268,6 +283,14 @@ impl App {
     }
 
     pub(super) fn handle_detailed_editor_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.detailed_editor = None;
+            self.status = "Detailed resolution edit cancelled.".to_string();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.detailed_editor = None;
@@ -324,6 +347,14 @@ impl App {
     }
 
     pub(super) fn handle_standard_editor_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.standard_editor = None;
+            self.status = "Standard resolution edit cancelled.".to_string();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.standard_editor = None;
@@ -380,6 +411,14 @@ impl App {
     }
 
     pub(super) fn handle_import_dialog_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.import_dialog = None;
+            self.status = "Import cancelled.".to_string();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.import_dialog = None;
@@ -426,6 +465,14 @@ impl App {
     }
 
     pub(super) fn handle_export_dialog_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.export_dialog = None;
+            self.status = "Export summary closed.".to_string();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
             self.export_dialog = None;
             self.status = "Export summary closed.".to_string();
@@ -433,6 +480,14 @@ impl App {
     }
 
     pub(super) fn handle_details_dialog_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.details_dialog = None;
+            self.status = "Details closed.".to_string();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
                 self.details_dialog = None;
@@ -473,6 +528,14 @@ impl App {
     }
 
     pub(super) fn handle_export_confirm_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.export_confirm_dialog = None;
+            self.status = "Export cancelled after validation warnings.".to_string();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Enter => {
                 self.export_confirm_dialog = None;
@@ -487,6 +550,13 @@ impl App {
     }
 
     pub(super) fn handle_apply_confirm_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.cancel_apply();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Enter => self.confirm_apply(),
             KeyCode::Esc => self.cancel_apply(),
@@ -515,6 +585,13 @@ impl App {
     }
 
     pub(super) fn handle_apply_result_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.dismiss_apply_result();
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Enter => self.dismiss_apply_result(),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -625,6 +702,13 @@ impl App {
 
 impl App {
     pub(super) fn handle_vrr_editor_key(&mut self, key: KeyEvent) {
+        if is_ctrl_c(key) {
+            self.vrr_editor = None;
+            return;
+        }
+        if has_command_modifier(key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.vrr_editor = None;

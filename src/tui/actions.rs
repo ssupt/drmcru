@@ -759,7 +759,13 @@ impl App {
         match workspace.reset() {
             Ok(()) => {
                 self.selected_detailed = None;
+                self.selected_standard = None;
+                self.selected_established = None;
                 self.selected_extension = None;
+                self.established_scroll = 0;
+                self.detailed_scroll = 0;
+                self.standard_scroll = 0;
+                self.extension_scroll = 0;
                 self.status = "Reset working EDID to the original monitor EDID.".to_string();
             }
             Err(error) => {
@@ -773,10 +779,12 @@ impl App {
             return;
         };
         let mode = editor.mode;
-        let Ok(timing) = editor.timing() else {
-            self.status =
-                "Cannot apply: width, height, and refresh must be valid numbers.".to_string();
-            return;
+        let timing = match editor.timing() {
+            Ok(timing) => timing,
+            Err(reason) => {
+                self.status = format!("Cannot apply detailed timing: {reason}.");
+                return;
+            }
         };
 
         let result = match mode {
@@ -831,7 +839,10 @@ impl App {
                 self.draft_timing = timing;
                 self.detailed_editor = None;
                 if matches!(mode, EditorMode::Add) {
-                    self.selected_detailed = self.working_dtds().len().checked_sub(1);
+                    self.selected_detailed = self
+                        .working_dtds()
+                        .iter()
+                        .position(|row| row.location == location);
                 } else if matches!(mode, EditorMode::AddCta { .. }) {
                     self.selected_extension = self.extension_row_index_for_location(location);
                 }
@@ -942,8 +953,13 @@ impl App {
         match result {
             Ok(()) => {
                 self.selected_detailed = None;
+                self.selected_standard = None;
                 self.selected_established = None;
                 self.selected_extension = None;
+                self.established_scroll = 0;
+                self.detailed_scroll = 0;
+                self.standard_scroll = 0;
+                self.extension_scroll = 0;
                 self.import_dialog = None;
                 self.details_dialog = None;
                 self.status = format!("Imported EDID from {} into workspace.", path.display());

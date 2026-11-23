@@ -124,10 +124,11 @@ pub(super) struct ApplyResultDialog {
 
 impl ApplyResultDialog {
     pub(super) fn scroll_by(&mut self, delta: isize) {
+        let max_scroll = self.output.lines().count().saturating_add(5);
         if delta < 0 {
             self.scroll = self.scroll.saturating_sub(delta.unsigned_abs());
         } else {
-            self.scroll = self.scroll.saturating_add(delta as usize);
+            self.scroll = self.scroll.saturating_add(delta as usize).min(max_scroll);
         }
     }
 }
