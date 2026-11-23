@@ -937,7 +937,7 @@ impl App {
             return;
         }
 
-        let raw = match fs::read(&path) {
+        let raw = match read_import_file(&path) {
             Ok(raw) => raw,
             Err(error) => {
                 self.status = format!("Import failed: could not read {}: {error}", path.display());
@@ -2186,4 +2186,34 @@ fn polarity_label(positive: bool) -> &'static str {
 
 fn checksum_label(valid: bool) -> &'static str {
     if valid { "ok" } else { "bad" }
+}
+
+/// Largest valid EDID: a base block plus 255 extension blocks.
+const MAX_IMPORT_LEN: u64 = 256 * 128;
+
+/// Read an import candidate without blocking on FIFOs or devices and without
+/// loading arbitrarily large files into memory.
+pub(super) fn read_import_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if metadata.len() > MAX_IMPORT_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("larger than the {MAX_IMPORT_LEN}-byte EDID maximum"),
+        ));
+    }
+    let mut raw = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_IMPORT_LEN + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_IMPORT_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "file grew while reading",
+        ));
+    }
+    Ok(raw)
 }

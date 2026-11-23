@@ -23,6 +23,10 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - run: cargo +stable fmt --check
+      - name: Shellcheck privileged scripts
+        # SC2154/SC1090: variables and the Limine library come from the
+        # prologue that install.rs generates.
+        run: shellcheck -s bash -S warning -e SC2154,SC1090 src/*.sh tests/fixtures/*.sh
       - run: cargo +stable clippy --all-targets -- -D warnings
       - run: cargo +stable test --locked
 

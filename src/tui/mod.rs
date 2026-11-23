@@ -1089,4 +1089,19 @@ mod tests {
         );
         assert!(app.status.contains("blocked"));
     }
+
+    #[test]
+    fn import_reads_only_bounded_regular_files() {
+        let dir = std::env::temp_dir().join(format!("drmcru-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let edid = dir.join("edid.bin");
+        std::fs::write(&edid, [0u8; 256]).unwrap();
+        assert_eq!(actions::read_import_file(&edid).unwrap().len(), 256);
+        let large = dir.join("large.bin");
+        std::fs::write(&large, vec![0u8; 256 * 128 + 1]).unwrap();
+        assert!(actions::read_import_file(&large).is_err());
+        assert!(actions::read_import_file(&dir).is_err());
+        assert!(actions::read_import_file(std::path::Path::new("/dev/zero")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

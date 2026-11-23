@@ -1094,3 +1094,36 @@ fn preview_summary_has_all_targets() {
     assert!(lines[7].contains("drm.edid_firmware"));
     assert!(lines[8].contains("verify"));
 }
+
+#[test]
+fn pkexec_exit_codes_are_classified() {
+    assert!(matches!(
+        classify_failure(126, String::new()),
+        InstallError::Cancelled
+    ));
+    assert!(matches!(
+        classify_failure(127, String::new()),
+        InstallError::NotAuthorized(_)
+    ));
+    assert!(matches!(
+        classify_failure(1, String::new()),
+        InstallError::ScriptFailed { code: 1, .. }
+    ));
+}
+
+#[test]
+fn script_failures_never_use_pkexec_reserved_exit_codes() {
+    for code in [126, 127] {
+        let fixture = ScriptFixture::new();
+        let before = fixture.boot();
+        fixture.command("mkinitcpio", &format!("exit {code}"));
+        let output = fixture.run(false);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fixture.boot(), before);
+    }
+}

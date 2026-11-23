@@ -60,6 +60,8 @@ finish() {
     fi
     if [ "$PACKAGE_LOCK_OWNED" -eq 1 ] && [ "$(cat "$PACKAGE_LOCK" 2>/dev/null)" = "drmcru-$$" ]; then rm -f -- "$PACKAGE_LOCK"; fi
     if [ -n "$TX" ] && [ "$failed" -eq 0 ]; then rm -rf -- "$TX"; fi
+    # pkexec reserves 126 (dialog dismissed) and 127 (not authorized).
+    case "$status" in 126|127) status=1 ;; esac
     exit "$status"
 }
 trap finish EXIT

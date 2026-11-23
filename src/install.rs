@@ -378,6 +378,10 @@ pub enum InstallError {
     ScriptFailed { code: i32, output: String },
     #[error("privileged script was cancelled by the user")]
     Cancelled,
+    #[error(
+        "authorization failed; check the password and that a polkit authentication agent is running: {0}"
+    )]
+    NotAuthorized(String),
     #[error("unsupported automatic Apply environment: {0}")]
     UnsupportedSystem(String),
 }
@@ -923,13 +927,17 @@ fn run_privileged_script(script: &str) -> Result<InstallReport, InstallError> {
             output,
         })
     } else {
-        let code = result.status.code().unwrap_or(-1);
-        // pkexec returns 126 when the user dismisses the auth dialog
-        if code == 126 {
-            Err(InstallError::Cancelled)
-        } else {
-            Err(InstallError::ScriptFailed { code, output })
-        }
+        Err(classify_failure(result.status.code().unwrap_or(-1), output))
+    }
+}
+
+/// pkexec exits 126 when the dialog is dismissed and 127 when authorization
+/// fails; the privileged script maps those codes to 1 so they stay unambiguous.
+fn classify_failure(code: i32, output: String) -> InstallError {
+    match code {
+        126 => InstallError::Cancelled,
+        127 => InstallError::NotAuthorized(output),
+        _ => InstallError::ScriptFailed { code, output },
     }
 }
 
