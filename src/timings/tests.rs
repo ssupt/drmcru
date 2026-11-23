@@ -681,7 +681,7 @@ fn table_clock_10khz(row: &TableTiming, millihz: i64) -> i64 {
 
 #[test]
 fn interlaced_presets_produce_encodable_half_lines() {
-    for preset in TimingPreset::ALL.into_iter().skip(1).take(12) {
+    for preset in TimingPreset::ALL.into_iter().skip(1) {
         let timing = timing_for_preset(
             preset,
             request(1920, 1080, 60.0, true),
@@ -698,6 +698,14 @@ fn interlaced_presets_produce_encodable_half_lines() {
             "{preset:?}"
         );
     }
+    assert!(
+        timing_for_preset(
+            TimingPreset::CvtRbStandard,
+            request(1920, 1081, 60.0, true),
+            None,
+        )
+        .is_err()
+    );
 }
 
 #[test]

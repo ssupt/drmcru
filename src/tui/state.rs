@@ -194,6 +194,7 @@ impl Default for ImportDialog {
 
 #[derive(Debug, Clone)]
 pub(super) struct DetailedResolutionEditor {
+    base_timing: TimingDescriptor,
     h_active: TextInput,
     v_active: TextInput,
     h_front: TextInput,
@@ -237,10 +238,11 @@ impl DetailedResolutionEditor {
                 "{:.3}",
                 timing.horizontal_rate_khz().unwrap_or_default()
             )),
-            refresh_hint: TextInput::new(format!("{:.2}", timing.refresh_hz().unwrap_or(60.0))),
+            refresh_hint: TextInput::new(format_refresh_hint(timing.refresh_hz().unwrap_or(60.0))),
             h_sync_positive: timing.h_sync_positive,
             v_sync_positive: timing.v_sync_positive,
             interlaced: timing.interlaced,
+            base_timing: timing,
             preset: TimingPreset::Manual,
             active_field: EditorField::Width,
             mode,
@@ -248,13 +250,12 @@ impl DetailedResolutionEditor {
     }
 
     pub(super) fn timing(&self) -> Result<TimingDescriptor, &'static str> {
-        let manual = self.manual_timing()?;
         if self.preset == TimingPreset::Manual {
-            return Ok(manual);
+            return self.manual_timing();
         }
 
         let request = self.preset_request()?;
-        timing_for_preset(self.preset, request, Some(&manual))
+        timing_for_preset(self.preset, request, Some(&self.base_timing))
     }
 
     pub(super) fn manual_timing(&self) -> Result<TimingDescriptor, &'static str> {
@@ -284,6 +285,23 @@ impl DetailedResolutionEditor {
             .checked_add(v_sync)
             .and_then(|value| value.checked_add(v_back))
             .ok_or("vertical blanking exceeds EDID limits")?;
+
+        if self.h_blanking.buffer.parse::<u32>().ok() != Some(u32::from(h_blanking)) {
+            return Err("horizontal blanking must be at least H Front + H Sync");
+        }
+        if self.h_total.buffer.parse::<u32>().ok()
+            != Some(u32::from(h_active) + u32::from(h_blanking))
+        {
+            return Err("horizontal total must be at least H Active + H Front + H Sync");
+        }
+        if self.v_blanking.buffer.parse::<u32>().ok() != Some(u32::from(v_blanking)) {
+            return Err("vertical blanking must be at least V Front + V Sync");
+        }
+        if self.v_total.buffer.parse::<u32>().ok()
+            != Some(u32::from(v_active) + u32::from(v_blanking))
+        {
+            return Err("vertical total must be at least V Active + V Front + V Sync");
+        }
 
         Ok(TimingDescriptor {
             pixel_clock_khz,
@@ -495,7 +513,7 @@ impl DetailedResolutionEditor {
     }
 
     pub(super) fn set_cursor_from_column(&mut self, field: EditorField, column: u16, rect: Rect) {
-        let left_padding = 13usize;
+        let left_padding = 12usize;
         self.active_field = field;
         if self.toggle_field(field) {
             return;
@@ -608,15 +626,21 @@ impl DetailedResolutionEditor {
             EditorField::HPolarity => {
                 self.preset = TimingPreset::Manual;
                 self.h_sync_positive = !self.h_sync_positive;
+                self.refresh_base_timing();
             }
             EditorField::VPolarity => {
                 self.preset = TimingPreset::Manual;
                 self.v_sync_positive = !self.v_sync_positive;
+                self.refresh_base_timing();
             }
             EditorField::Interlaced => {
-                self.preset = TimingPreset::Manual;
                 self.interlaced = !self.interlaced;
-                self.update_rate_fields_from_pixel_clock(EditorField::Interlaced);
+                if self.preset != TimingPreset::Manual {
+                    self.apply_preset_to_fields(None);
+                } else {
+                    self.update_rate_fields_from_pixel_clock(EditorField::Interlaced);
+                    self.refresh_base_timing();
+                }
             }
             _ => return false,
         }
@@ -626,7 +650,7 @@ impl DetailedResolutionEditor {
     pub(super) fn cycle_preset(&mut self, delta: isize) {
         self.preset = self.preset.cycle(delta);
         if self.preset != TimingPreset::Manual {
-            self.apply_preset_to_fields();
+            self.apply_preset_to_fields(None);
         }
     }
 
@@ -637,7 +661,7 @@ impl DetailedResolutionEditor {
                 EditorField::Width | EditorField::Height | EditorField::Refresh
             )
         {
-            self.apply_preset_to_fields();
+            self.apply_preset_to_fields(Some(field));
             return;
         }
 
@@ -649,24 +673,28 @@ impl DetailedResolutionEditor {
             EditorField::Refresh => self.set_pixel_clock_from_refresh(),
             EditorField::HRate => self.set_pixel_clock_from_h_rate(),
             EditorField::HBlanking => {
-                self.set_h_back_from_blanking();
-                self.sync_horizontal_totals();
-                self.update_rate_fields_from_pixel_clock(field);
+                if self.set_h_back_from_blanking() {
+                    self.sync_horizontal_totals(Some(field));
+                    self.update_rate_fields_from_pixel_clock(field);
+                }
             }
             EditorField::HTotal => {
-                self.set_h_back_from_total();
-                self.sync_horizontal_totals();
-                self.update_rate_fields_from_pixel_clock(field);
+                if self.set_h_back_from_total() {
+                    self.sync_horizontal_totals(Some(field));
+                    self.update_rate_fields_from_pixel_clock(field);
+                }
             }
             EditorField::VBlanking => {
-                self.set_v_back_from_blanking();
-                self.sync_vertical_totals();
-                self.update_rate_fields_from_pixel_clock(field);
+                if self.set_v_back_from_blanking() {
+                    self.sync_vertical_totals(Some(field));
+                    self.update_rate_fields_from_pixel_clock(field);
+                }
             }
             EditorField::VTotal => {
-                self.set_v_back_from_total();
-                self.sync_vertical_totals();
-                self.update_rate_fields_from_pixel_clock(field);
+                if self.set_v_back_from_total() {
+                    self.sync_vertical_totals(Some(field));
+                    self.update_rate_fields_from_pixel_clock(field);
+                }
             }
             EditorField::Width | EditorField::Height => {
                 self.sync_aggregate_fields();
@@ -685,22 +713,36 @@ impl DetailedResolutionEditor {
             }
             _ => {}
         }
+        self.refresh_base_timing();
     }
 
-    pub(super) fn apply_preset_to_fields(&mut self) {
+    fn refresh_base_timing(&mut self) {
+        if let Ok(manual) = self.manual_timing() {
+            self.base_timing = manual;
+        }
+    }
+
+    pub(super) fn apply_preset_to_fields(&mut self, edited_field: Option<EditorField>) {
         let Ok(request) = self.preset_request() else {
             return;
         };
-        let current = self.manual_timing().ok();
-        let Ok(timing) = timing_for_preset(self.preset, request, current.as_ref()) else {
+        let Ok(timing) = timing_for_preset(self.preset, request, Some(&self.base_timing)) else {
             return;
         };
-        self.set_timing_fields(&timing);
+        self.set_timing_fields(&timing, edited_field);
     }
 
-    pub(super) fn set_timing_fields(&mut self, timing: &TimingDescriptor) {
-        self.h_active.set(timing.h_active.to_string());
-        self.v_active.set(timing.v_active.to_string());
+    pub(super) fn set_timing_fields(
+        &mut self,
+        timing: &TimingDescriptor,
+        edited_field: Option<EditorField>,
+    ) {
+        if edited_field != Some(EditorField::Width) {
+            self.h_active.set(timing.h_active.to_string());
+        }
+        if edited_field != Some(EditorField::Height) {
+            self.v_active.set(timing.v_active.to_string());
+        }
         self.h_front.set(timing.h_front_porch.to_string());
         self.h_sync.set(timing.h_sync_width.to_string());
         self.h_back.set(timing.h_back_porch.to_string());
@@ -743,70 +785,90 @@ impl DetailedResolutionEditor {
     }
 
     pub(super) fn sync_aggregate_fields(&mut self) {
-        self.sync_horizontal_totals();
-        self.sync_vertical_totals();
+        self.sync_horizontal_totals(None);
+        self.sync_vertical_totals(None);
     }
 
-    pub(super) fn sync_horizontal_totals(&mut self) {
+    pub(super) fn sync_horizontal_totals(&mut self, edited_field: Option<EditorField>) {
         let Some((h_active, h_front, h_sync, h_back)) = self.horizontal_parts() else {
             return;
         };
         let h_blanking = h_front + h_sync + h_back;
-        self.h_blanking.set(h_blanking.to_string());
-        self.h_total.set((h_active + h_blanking).to_string());
+        if edited_field != Some(EditorField::HBlanking) {
+            self.h_blanking.set(h_blanking.to_string());
+        }
+        if edited_field != Some(EditorField::HTotal) {
+            self.h_total.set((h_active + h_blanking).to_string());
+        }
     }
 
-    pub(super) fn sync_vertical_totals(&mut self) {
+    pub(super) fn sync_vertical_totals(&mut self, edited_field: Option<EditorField>) {
         let Some((v_active, v_front, v_sync, v_back)) = self.vertical_parts() else {
             return;
         };
         let v_blanking = v_front + v_sync + v_back;
-        self.v_blanking.set(v_blanking.to_string());
-        self.v_total.set((v_active + v_blanking).to_string());
+        if edited_field != Some(EditorField::VBlanking) {
+            self.v_blanking.set(v_blanking.to_string());
+        }
+        if edited_field != Some(EditorField::VTotal) {
+            self.v_total.set((v_active + v_blanking).to_string());
+        }
     }
 
-    pub(super) fn set_h_back_from_blanking(&mut self) {
+    pub(super) fn set_h_back_from_blanking(&mut self) -> bool {
         let Ok(blanking) = self.h_blanking.buffer.parse::<u32>() else {
-            return;
+            return false;
         };
         let Some((_, front, sync, _)) = self.horizontal_parts() else {
-            return;
+            return false;
         };
-        let back = blanking.saturating_sub(front + sync);
+        let Some(back) = blanking.checked_sub(front + sync) else {
+            return false;
+        };
         self.h_back.set(back.min(u32::from(u16::MAX)).to_string());
+        true
     }
 
-    pub(super) fn set_h_back_from_total(&mut self) {
+    pub(super) fn set_h_back_from_total(&mut self) -> bool {
         let Ok(total) = self.h_total.buffer.parse::<u32>() else {
-            return;
+            return false;
         };
         let Some((active, front, sync, _)) = self.horizontal_parts() else {
-            return;
+            return false;
         };
-        let back = total.saturating_sub(active + front + sync);
+        let Some(back) = total.checked_sub(active + front + sync) else {
+            return false;
+        };
         self.h_back.set(back.min(u32::from(u16::MAX)).to_string());
+        true
     }
 
-    pub(super) fn set_v_back_from_blanking(&mut self) {
+    pub(super) fn set_v_back_from_blanking(&mut self) -> bool {
         let Ok(blanking) = self.v_blanking.buffer.parse::<u32>() else {
-            return;
+            return false;
         };
         let Some((_, front, sync, _)) = self.vertical_parts() else {
-            return;
+            return false;
         };
-        let back = blanking.saturating_sub(front + sync);
+        let Some(back) = blanking.checked_sub(front + sync) else {
+            return false;
+        };
         self.v_back.set(back.min(u32::from(u16::MAX)).to_string());
+        true
     }
 
-    pub(super) fn set_v_back_from_total(&mut self) {
+    pub(super) fn set_v_back_from_total(&mut self) -> bool {
         let Ok(total) = self.v_total.buffer.parse::<u32>() else {
-            return;
+            return false;
         };
         let Some((active, front, sync, _)) = self.vertical_parts() else {
-            return;
+            return false;
         };
-        let back = total.saturating_sub(active + front + sync);
+        let Some(back) = total.checked_sub(active + front + sync) else {
+            return false;
+        };
         self.v_back.set(back.min(u32::from(u16::MAX)).to_string());
+        true
     }
 
     pub(super) fn set_pixel_clock_from_h_rate(&mut self) {
@@ -939,6 +1001,9 @@ impl StandardResolutionEditor {
         let Some(aspect) = StandardTimingAspect::from_dimensions(width, height) else {
             return Err("height must match 16:10, 4:3, 5:4, or 16:9 exactly");
         };
+        if width == 256 && height == 160 && refresh_hz == 61 {
+            return Err("256x160 at 61 Hz encodes the unused-slot marker");
+        }
 
         Ok(StandardTiming {
             slot: 0,
@@ -1015,7 +1080,7 @@ impl StandardResolutionEditor {
     }
 
     pub(super) fn set_cursor_from_column(&mut self, field: EditorField, column: u16, rect: Rect) {
-        let left_padding = 13usize;
+        let left_padding = 12usize;
         let input = match field {
             EditorField::Width => &mut self.width,
             EditorField::Height => &mut self.height,
@@ -1055,6 +1120,11 @@ impl StandardResolutionEditor {
             self.active_input_mut().insert(value);
         }
     }
+}
+
+fn format_refresh_hint(refresh_hz: f64) -> String {
+    let text = format!("{refresh_hz:.3}");
+    text.strip_suffix('0').unwrap_or(&text).to_string()
 }
 
 fn detailed_field_order() -> [(EditorField, &'static str); 19] {
@@ -1327,24 +1397,162 @@ mod tests {
         assert_eq!(editor.timing().unwrap().pixel_clock_khz, 61_875);
         editor.preset = TimingPreset::Exact;
         assert!((editor.timing().unwrap().refresh_hz().unwrap() - 50.0).abs() < 0.001);
+        // Toggling interlace in a preset keeps the preset active and yields a valid timing.
         editor.toggle_field(EditorField::Interlaced);
+        assert_eq!(editor.preset, TimingPreset::Exact);
+        assert!(!editor.timing().unwrap().interlaced);
+        assert!(editor.timing().unwrap().edid_vertical_fields().is_ok());
+        assert!((editor.timing().unwrap().refresh_hz().unwrap() - 50.0).abs() < 0.001);
+        editor.toggle_field(EditorField::Interlaced);
+        assert_eq!(editor.preset, TimingPreset::Exact);
+        assert!(editor.timing().unwrap().interlaced);
+        assert!(editor.timing().unwrap().edid_vertical_fields().is_ok());
+
+        // Toggling interlace in Manual mode preserves pixel clock and halves/doubles refresh.
+        let mut manual_editor =
+            DetailedResolutionEditor::from_timing(timing.clone(), EditorMode::Add);
+        manual_editor
+            .input_mut(EditorField::Refresh)
+            .set("50.00".into());
+        manual_editor.set_pixel_clock_from_refresh();
+        manual_editor.toggle_field(EditorField::Interlaced);
         assert_eq!(
-            editor
+            manual_editor
                 .input(EditorField::Refresh)
                 .buffer
                 .parse::<f64>()
                 .unwrap(),
             25.0
         );
-        editor.toggle_field(EditorField::Interlaced);
+        manual_editor.toggle_field(EditorField::Interlaced);
         assert_eq!(
-            editor
+            manual_editor
                 .input(EditorField::Refresh)
                 .buffer
                 .parse::<f64>()
                 .unwrap(),
             50.0
         );
+    }
+
+    #[test]
+    fn cycling_presets_and_typing_qft_refresh_preserve_base_timing() {
+        let base = TimingDescriptor {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_blanking: 280,
+            h_front_porch: 88,
+            h_sync_width: 44,
+            h_back_porch: 148,
+            v_active: 1080,
+            v_blanking: 45,
+            v_front_porch: 4,
+            v_sync_width: 5,
+            v_back_porch: 36,
+            h_sync_positive: true,
+            v_sync_positive: false,
+            interlaced: false,
+        };
+
+        // Cycling right through all presets vs left 1 step must produce identical QFT timings.
+        let mut right = DetailedResolutionEditor::from_timing(base.clone(), EditorMode::Add);
+        for _ in 0..13 {
+            right.cycle_preset(1);
+        }
+        assert_eq!(right.preset, TimingPreset::VerticalTotal);
+
+        let mut left = DetailedResolutionEditor::from_timing(base.clone(), EditorMode::Add);
+        left.cycle_preset(-1);
+        assert_eq!(left.preset, TimingPreset::VerticalTotal);
+        assert_eq!(right.timing().unwrap(), left.timing().unwrap());
+
+        // Cycling right vs left to Exact preserves the base polarity (H+ V-).
+        let mut exact_right = DetailedResolutionEditor::from_timing(base.clone(), EditorMode::Add);
+        for _ in 0..6 {
+            exact_right.cycle_preset(1);
+        }
+        assert_eq!(exact_right.preset, TimingPreset::Exact);
+        assert_eq!(
+            (
+                exact_right.timing().unwrap().h_sync_positive,
+                exact_right.timing().unwrap().v_sync_positive
+            ),
+            (true, false)
+        );
+
+        // Typing a refresh digit-by-digit in QFT must not drift away from base_timing pixel clock.
+        let mut qft = DetailedResolutionEditor::from_timing(base.clone(), EditorMode::Add);
+        qft.cycle_preset(-1);
+        qft.active_field = EditorField::Refresh;
+        qft.input_mut(EditorField::Refresh).set(String::new());
+        for ch in "59.94".chars() {
+            qft.insert_char(ch);
+        }
+        let direct = timing_for_preset(
+            TimingPreset::VerticalTotal,
+            CvtRequest {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 59.94,
+                interlaced: false,
+            },
+            Some(&base),
+        )
+        .unwrap();
+        assert_eq!(qft.timing().unwrap(), direct);
+    }
+
+    #[test]
+    fn aggregate_blanking_fields_can_be_backspaced_and_preset_width_keeps_cursor() {
+        let initial = crate::timings::cvt_reduced_blanking(CvtRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+            interlaced: false,
+        })
+        .unwrap();
+        let mut editor = DetailedResolutionEditor::from_timing(initial.clone(), EditorMode::Add);
+        editor.active_field = EditorField::HBlanking;
+        // Backspace 160 -> 16 -> 1 -> "" without snapping back to 80.
+        editor.backspace();
+        assert_eq!(editor.input(EditorField::HBlanking).buffer, "16");
+        assert!(editor.manual_timing().is_err());
+        editor.backspace();
+        assert_eq!(editor.input(EditorField::HBlanking).buffer, "1");
+        editor.backspace();
+        assert_eq!(editor.input(EditorField::HBlanking).buffer, "");
+        for ch in "280".chars() {
+            editor.insert_char(ch);
+        }
+        assert_eq!(editor.input(EditorField::HBlanking).buffer, "280");
+        assert_eq!(editor.manual_timing().unwrap().h_back_porch, 200);
+
+        // Mid-string width edit in preset mode keeps the cursor position.
+        let mut preset_editor = DetailedResolutionEditor::from_timing(initial, EditorMode::Add);
+        preset_editor.cycle_preset(1);
+        preset_editor.active_field = EditorField::Width;
+        preset_editor.input_mut(EditorField::Width).cursor = 1; // 1|920
+        preset_editor.backspace(); // |920
+        assert_eq!(preset_editor.input(EditorField::Width).cursor, 0);
+        preset_editor.insert_char('2'); // 2|920
+        assert_eq!(preset_editor.input(EditorField::Width).buffer, "2920");
+    }
+
+    #[test]
+    fn standard_editor_rejects_unused_slot_marker_and_preserves_fractional_refresh_hint() {
+        let editor = StandardResolutionEditor::from_timing(
+            StandardTiming {
+                slot: 0,
+                width: 256,
+                height: 160,
+                refresh_hz: 61,
+                aspect: StandardTimingAspect::SixteenTen,
+            },
+            StandardEditorMode::Add,
+        );
+        assert!(editor.timing().is_err());
+        assert_eq!(format_refresh_hint(60.0), "60.00");
+        assert_eq!(format_refresh_hint(23.976), "23.976");
     }
 
     #[test]

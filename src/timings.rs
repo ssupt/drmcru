@@ -349,7 +349,8 @@ impl Calc {
             && self.h_total <= max_active + l.max_h_blank
     }
     fn v_active_in(&self, l: &Limits) -> bool {
-        (1..=l.max_v_active).contains(&self.value(self.v_active))
+        (!self.interlaced || self.v_active % 2 == 0)
+            && (1..=l.max_v_active).contains(&self.value(self.v_active))
     }
     fn v_front_in(&self, l: &Limits) -> bool {
         (1..=l.max_v_front).contains(&self.value(self.v_front))
@@ -1017,14 +1018,40 @@ impl Calc {
         self.h_front = i64::from(current.h_front_porch);
         self.h_sync = i64::from(current.h_sync_width);
         self.h_back = i64::from(current.h_back_porch);
-        self.v_front = i64::from(current.v_front_porch);
-        self.v_sync = i64::from(current.v_sync_width);
+        let (v_front, v_sync) = match (current.interlaced, self.interlaced) {
+            (false, true) => (
+                i64::from(current.v_front_porch) * 2,
+                i64::from(current.v_sync_width) * 2,
+            ),
+            (true, false) => (
+                (i64::from(current.v_front_porch) / 2).max(1),
+                (i64::from(current.v_sync_width) / 2).max(1),
+            ),
+            (true, true) => {
+                if !current.v_front_porch.is_multiple_of(2)
+                    || !current.v_sync_width.is_multiple_of(2)
+                {
+                    return false;
+                }
+                (
+                    i64::from(current.v_front_porch),
+                    i64::from(current.v_sync_width),
+                )
+            }
+            (false, false) => (
+                i64::from(current.v_front_porch),
+                i64::from(current.v_sync_width),
+            ),
+        };
+        self.v_front = v_front;
+        self.v_sync = v_sync;
         self.pclock = i64::from(current.pixel_clock_khz) * PCLOCK_PRECISION / 1000;
         self.calculate_h_blank();
         self.calculate_h_total();
 
         self.v_total = BLANK;
-        if Self::pclock_in(self.pclock, &SUPPORTED)
+        if self.v_active_in(&SUPPORTED)
+            && Self::pclock_in(self.pclock, &SUPPORTED)
             && self.h_total_in(&SUPPORTED)
             && self.v_rate_supported()
         {
