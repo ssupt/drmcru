@@ -59,7 +59,7 @@ END {
         combined = combined (combined == "" ? "" : ",") value
     }
     if (operation != "mappings") {
-        if (replace_others) others = retained_others
+        if (replace_others) others = ("RETAINED_OTHERS" in ENVIRON) ? ENVIRON["RETAINED_OTHERS"] : retained_others
         if (operation == "strip") print others
         else print others (combined == "" ? "" : (others == "" ? "" : " ") "drm.edid_firmware=" combined)
     }

@@ -132,13 +132,21 @@ fn report_text(
                 monitor.edid.as_ref().map(|edid| edid.raw.as_slice()),
             );
             lines.push(format!("   Override: {}", status.short_label()));
+            let boot_config = if status.bootloader_validation_deferred {
+                "deferred (permission denied)".to_string()
+            } else {
+                format!(
+                    "{} ({}/{} cmdline entries)",
+                    yes_no(status.bootloader_references_kernel_parameter),
+                    status.bootloader_cmdline_entries_with_kernel_parameter,
+                    status.bootloader_cmdline_entries
+                )
+            };
             lines.push(format!(
-                "   Override files: firmware {}, mkinitcpio {}, boot config {} ({}/{} cmdline entries), entry-tool {}, active kernel {}",
+                "   Override files: firmware {}, mkinitcpio {}, boot config {}, entry-tool {}, active kernel {}",
                 yes_no(status.firmware_present),
                 yes_no(status.mkinitcpio_references_firmware),
-                yes_no(status.bootloader_references_kernel_parameter),
-                status.bootloader_cmdline_entries_with_kernel_parameter,
-                status.bootloader_cmdline_entries,
+                boot_config,
                 yes_no(status.limine_entry_tool_references_kernel_parameter),
                 yes_no(status.active_kernel_references_kernel_parameter)
             ));
@@ -260,6 +268,7 @@ mod tests {
             firmware_present: true,
             mkinitcpio_references_firmware: true,
             bootloader_references_kernel_parameter: true,
+            bootloader_validation_deferred: false,
             limine_entry_tool_references_kernel_parameter: true,
             bootloader_cmdline_entries: 1,
             bootloader_cmdline_entries_with_kernel_parameter: 1,

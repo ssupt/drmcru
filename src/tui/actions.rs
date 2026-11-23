@@ -1463,12 +1463,17 @@ impl App {
             return;
         };
         let monitor = monitor.clone();
-        if let Err(error) = install::validate_connector_mapping(
-            &monitor.connector,
-            self.monitors
-                .iter()
-                .map(|monitor| monitor.connector.as_str()),
-        ) {
+        let connector_check = if monitor.drm_path.is_some() {
+            install::validate_system_connector_mapping(&monitor.connector)
+        } else {
+            install::validate_connector_mapping(
+                &monitor.connector,
+                self.monitors
+                    .iter()
+                    .map(|monitor| monitor.connector.as_str()),
+            )
+        };
+        if let Err(error) = connector_check {
             self.status = error;
             return;
         }
@@ -1482,10 +1487,6 @@ impl App {
             SystemOperation::Install
         };
 
-        let Ok(output_dir) = std::env::current_dir() else {
-            self.status = "Could not determine current output directory.".to_string();
-            return;
-        };
         let Some(workspace) = self
             .selected_workspace()
             .filter(|workspace| workspace.has_changes())
@@ -1522,7 +1523,7 @@ impl App {
         let edid_file_name = custom_edid_file_name(&connector);
         let plan = InstallPlan {
             connector: connector.clone(),
-            edid_source: output_dir.join(&edid_file_name),
+            edid_source: PathBuf::from("staged workspace EDID"),
             kernel_parameter: format!("drm.edid_firmware={connector}:edid/{edid_file_name}"),
             edid_file_name,
         };
@@ -1573,8 +1574,6 @@ impl App {
         self.pending_system_action = Some(PendingSystemAction::Install {
             monitor: Box::new(monitor),
             workspace: Box::new(workspace),
-            hyprland_mode,
-            output_dir,
             operation,
         });
         self.apply_confirm_dialog = Some(ApplyConfirmDialog::new(operation, summary_lines));
@@ -1670,30 +1669,25 @@ impl App {
 
         let execution = match action {
             PendingSystemAction::Install {
-                monitor,
-                workspace,
-                hyprland_mode,
-                output_dir,
-                ..
+                monitor, workspace, ..
             } => {
-                let export_result = match export_workspace_edid(
-                    &monitor,
-                    &workspace,
-                    &hyprland_mode,
-                    &output_dir,
-                ) {
-                    Ok(result) => result,
+                let staged_path = match install::stage_temp_edid(&workspace.export_bytes()) {
+                    Ok(path) => path,
                     Err(error) => {
                         self.apply_confirm_dialog = None;
-                        self.status = format!("Apply failed during export: {error}");
+                        self.status = format!("Apply failed while staging EDID: {error}");
                         return;
                     }
                 };
+                let connector = monitor.connector;
+                let edid_file_name = custom_edid_file_name(&connector);
+                let kernel_parameter =
+                    format!("drm.edid_firmware={connector}:edid/{edid_file_name}");
                 SystemExecution::Install(InstallPlan {
-                    connector: monitor.connector,
-                    edid_source: export_result.path,
-                    edid_file_name: export_result.plan.edid_file_name.clone(),
-                    kernel_parameter: export_result.plan.drm_kernel_parameter(),
+                    connector,
+                    edid_source: staged_path,
+                    edid_file_name,
+                    kernel_parameter,
                 })
             }
             PendingSystemAction::Uninstall(plan) => SystemExecution::Uninstall(plan),
@@ -1714,7 +1708,11 @@ impl App {
 
         std::thread::spawn(move || {
             let result = match execution {
-                SystemExecution::Install(plan) => install::install(&plan),
+                SystemExecution::Install(plan) => {
+                    let result = install::install(&plan);
+                    let _ = fs::remove_file(&plan.edid_source);
+                    result
+                }
                 SystemExecution::Uninstall(plan) => install::uninstall(&plan),
             };
             let _ = tx.send((operation, result));
@@ -1968,12 +1966,16 @@ fn append_override_status_lines(
         "mkinitcpio FILES:   {}",
         yes_no(status.mkinitcpio_references_firmware)
     ));
-    lines.push(format!(
-        "Bootloader config:  {} ({}/{} cmdline entries)",
-        yes_no(status.bootloader_references_kernel_parameter),
-        status.bootloader_cmdline_entries_with_kernel_parameter,
-        status.bootloader_cmdline_entries
-    ));
+    if status.bootloader_validation_deferred {
+        lines.push("Bootloader config:  deferred (permission denied)".to_string());
+    } else {
+        lines.push(format!(
+            "Bootloader config:  {} ({}/{} cmdline entries)",
+            yes_no(status.bootloader_references_kernel_parameter),
+            status.bootloader_cmdline_entries_with_kernel_parameter,
+            status.bootloader_cmdline_entries
+        ));
+    }
     lines.push(format!(
         "Limine entry-tool:  {}",
         yes_no(status.limine_entry_tool_references_kernel_parameter)
@@ -2205,10 +2207,19 @@ pub(super) fn read_import_file(path: &Path) -> std::io::Result<Vec<u8>> {
             format!("larger than the {MAX_IMPORT_LEN}-byte EDID maximum"),
         ));
     }
+    let file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if opened.len() > MAX_IMPORT_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("larger than the {MAX_IMPORT_LEN}-byte EDID maximum"),
+        ));
+    }
     let mut raw = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_IMPORT_LEN + 1)
-        .read_to_end(&mut raw)?;
+    file.take(MAX_IMPORT_LEN + 1).read_to_end(&mut raw)?;
     if raw.len() as u64 > MAX_IMPORT_LEN {
         return Err(Error::new(
             ErrorKind::InvalidData,

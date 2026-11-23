@@ -26,7 +26,9 @@ jobs:
       - name: Shellcheck privileged scripts
         # SC2154/SC1090: variables and the Limine library come from the
         # prologue that install.rs generates.
-        run: shellcheck -s bash -S warning -e SC2154,SC1090 src/*.sh tests/fixtures/*.sh
+        run: |
+          shellcheck -s bash -S warning -e SC2154,SC1090 src/*.sh tests/fixtures/*.sh
+          shellcheck -s bash -S warning scripts/*.sh
       - run: cargo +stable clippy --all-targets -- -D warnings
       - run: cargo +stable test --locked
 

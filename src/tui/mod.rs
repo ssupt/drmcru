@@ -22,7 +22,6 @@ use state::{
     ExportConfirmDialog, ExportDialog, ImportDialog, StandardResolutionEditor, SystemOperation,
 };
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 use support::{TerminalSession, wrap_index};
@@ -107,8 +106,6 @@ enum PendingSystemAction {
     Install {
         monitor: Box<Monitor>,
         workspace: Box<EdidWorkspace>,
-        hyprland_mode: String,
-        output_dir: PathBuf,
         operation: SystemOperation,
     },
     Uninstall(UninstallPlan),
@@ -1059,7 +1056,7 @@ mod tests {
 
     #[test]
     fn import_paths_expand_home_and_terminal_quotes() {
-        let home = PathBuf::from("/home/example");
+        let home = std::path::PathBuf::from("/home/example");
 
         assert_eq!(
             actions::normalize_import_path("~/Downloads/display.bin", Some(&home)),
@@ -1067,7 +1064,7 @@ mod tests {
         );
         assert_eq!(
             actions::normalize_import_path("'/tmp/display file.bin'", Some(&home)),
-            PathBuf::from("/tmp/display file.bin")
+            std::path::PathBuf::from("/tmp/display file.bin")
         );
     }
 
@@ -1094,16 +1091,34 @@ mod tests {
 
     #[test]
     fn import_reads_only_bounded_regular_files() {
-        let dir = std::env::temp_dir().join(format!("drmcru-import-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let edid = dir.join("edid.bin");
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("drmcru-import-{}-{nonce}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let edid = dir.0.join("edid.bin");
         std::fs::write(&edid, [0u8; 256]).unwrap();
         assert_eq!(actions::read_import_file(&edid).unwrap().len(), 256);
-        let large = dir.join("large.bin");
+        let large = dir.0.join("large.bin");
         std::fs::write(&large, vec![0u8; 256 * 128 + 1]).unwrap();
         assert!(actions::read_import_file(&large).is_err());
-        assert!(actions::read_import_file(&dir).is_err());
+        assert!(actions::read_import_file(&dir.0).is_err());
         assert!(actions::read_import_file(std::path::Path::new("/dev/zero")).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let fifo = dir.0.join("pipe.bin");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(mkfifo.success());
+        assert!(actions::read_import_file(&fifo).is_err());
     }
 }

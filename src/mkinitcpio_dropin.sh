@@ -1,16 +1,9 @@
 # Shared by the generated install and uninstall scripts. The caller supplies
 # the literal-array editor and backup/rollback functions.
 check_mkinitcpio_dropins() {
-    if { [ -e "$MKINIT_DROPIN" ] || [ -L "$MKINIT_DROPIN" ]; } && [ ! -f "$MKINIT_DROPIN" ]; then
+    if [ -L "$MKINIT_DROPIN" ] || { [ -e "$MKINIT_DROPIN" ] && [ ! -f "$MKINIT_DROPIN" ]; }; then
         echo "[ERR] $MKINIT_DROPIN must be a regular configuration file" >&2
         return 1
-    fi
-    if ! command -v limine-mkinitcpio >/dev/null 2>&1; then
-        local preset
-        for preset in /etc/mkinitcpio.d/*.preset; do
-            [ -f "$preset" ] || continue
-            awk "$PRESET_CONFIG_AWK" "$preset" || return 1
-        done
     fi
 }
 
@@ -19,7 +12,7 @@ remove_legacy_mkinitcpio_entry() {
     # installed literal entries need the legacy parser.
     if grep -qF -- "$FIRMWARE_TARGET" "$MKINIT"; then
         local tmp
-        tmp="$(mktemp /tmp/drmcru-mkinitcpio.XXXXXX)"
+        tmp="$(mktemp "${TX:-/tmp}/drmcru-mkinitcpio.XXXXXX")"
         awk -v path="$FIRMWARE_TARGET" -v operation=remove "$FILES_AWK" "$MKINIT" > "$tmp"
         if ! cmp -s -- "$tmp" "$MKINIT"; then
             backup_file "$MKINIT"
@@ -37,10 +30,8 @@ update_mkinitcpio_dropin() {
     elif [ ! -f "$MKINIT_DROPIN" ]; then
         return
     fi
-    if [ -f "$MKINIT_DROPIN" ]; then
-        backup_file "$MKINIT_DROPIN"
-    fi
-    tmp="$(mktemp /tmp/drmcru-mkinitcpio.XXXXXX)"
+    backup_file "$MKINIT_DROPIN"
+    tmp="$(mktemp "${TX:-/tmp}/drmcru-mkinitcpio.XXXXXX")"
     if [ -f "$MKINIT_DROPIN" ]; then
         awk -v path="$FIRMWARE_TARGET" -v operation="$operation" -v append=1 "$FILES_AWK" "$MKINIT_DROPIN" > "$tmp"
     else
