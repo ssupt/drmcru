@@ -64,20 +64,27 @@ pub struct ModeInspection {
     pub monitor_rule: Option<String>,
 }
 
+const REQUEST_REFRESH_TOLERANCE_HZ: f64 = 0.5;
+const EXACT_REFRESH_TOLERANCE_HZ: f64 = 0.015;
+
 impl ModeInspection {
     pub fn is_available(&self) -> bool {
         self.available_mode.is_some()
     }
 
     pub fn active_matches(&self) -> bool {
-        self.active.as_ref().is_some_and(|active| {
-            mode_matches_request(
-                active.width,
-                active.height,
-                active.refresh_hz,
-                &self.requested,
-            )
-        })
+        let Some(active) = self.active.as_ref() else {
+            return false;
+        };
+        if let Some(target) = self.available_mode.as_deref().and_then(parse_mode) {
+            return active_matches_target(active, &target);
+        }
+        mode_matches_request(
+            active.width,
+            active.height,
+            active.refresh_hz,
+            &self.requested,
+        )
     }
 }
 
@@ -102,19 +109,15 @@ pub fn switch_to_available_mode(
     let before = live_monitor(connector)?
         .ok_or_else(|| HyprlandError::MonitorNotFound(connector.to_string()))?;
     let before_actual = before.actual_mode();
-    let Some(mode_label) = before.mode_label_for_request(requested) else {
+    let Some(target_mode) = before.best_mode_for_request(requested) else {
         return Err(HyprlandError::ModeUnavailable {
             connector: connector.to_string(),
             mode: requested.label(),
         });
     };
+    let mode_label = target_mode.label();
 
-    if mode_matches_request(
-        before_actual.width,
-        before_actual.height,
-        before_actual.refresh_hz,
-        requested,
-    ) {
+    if active_matches_target(&before_actual, &target_mode) {
         return Ok(ModeSwitchReport {
             requested: requested.clone(),
             actual: Some(before_actual),
@@ -130,7 +133,7 @@ pub fn switch_to_available_mode(
     let monitor_rule = before.monitor_rule(connector, &mode_label);
     let output = apply_monitor_argument(&argument)?;
 
-    let actual = match wait_for_requested_mode(connector, requested) {
+    let actual = match wait_for_target_mode(connector, &target_mode) {
         Ok(actual) => actual,
         Err(error) => {
             let _ = apply_monitor_argument(&before.restore_argument(connector));
@@ -139,10 +142,7 @@ pub fn switch_to_available_mode(
     };
     let matched = actual
         .as_ref()
-        .map(|actual| {
-            mode_matches_request(actual.width, actual.height, actual.refresh_hz, requested)
-        })
-        .unwrap_or(false);
+        .is_some_and(|actual| active_matches_target(actual, &target_mode));
     let restored_previous_mode = if matched {
         false
     } else {
@@ -244,17 +244,17 @@ fn active_mode_for_connector(connector: &str) -> Result<Option<RuntimeModeActual
     Ok(live_monitor(connector)?.map(|monitor| monitor.actual_mode()))
 }
 
-fn wait_for_requested_mode(
+fn wait_for_target_mode(
     connector: &str,
-    requested: &ModeRequest,
+    target: &ParsedMode,
 ) -> Result<Option<RuntimeModeActual>, HyprlandError> {
-    poll_requested_mode(requested, 20, Duration::from_millis(100), || {
+    poll_target_mode(target, 20, Duration::from_millis(100), || {
         active_mode_for_connector(connector)
     })
 }
 
-fn poll_requested_mode<F>(
-    requested: &ModeRequest,
+fn poll_target_mode<F>(
+    target: &ParsedMode,
     attempts: usize,
     delay: Duration,
     mut read_mode: F,
@@ -272,9 +272,10 @@ where
             Ok(actual) => {
                 successful_read = true;
                 latest = actual;
-                if latest.as_ref().is_some_and(|actual| {
-                    mode_matches_request(actual.width, actual.height, actual.refresh_hz, requested)
-                }) {
+                if latest
+                    .as_ref()
+                    .is_some_and(|actual| active_matches_target(actual, target))
+                {
                     return Ok(latest);
                 }
             }
@@ -379,20 +380,19 @@ impl HyprlandMonitorJson {
         )
     }
 
-    fn mode_label_for_request(&self, requested: &ModeRequest) -> Option<String> {
-        if mode_matches_request(
-            self.width.unwrap_or_default(),
-            self.height.unwrap_or_default(),
-            self.refresh_rate.unwrap_or_default(),
-            requested,
-        ) {
-            return Some(format!(
-                "{}x{}@{}",
-                self.width.unwrap_or_default(),
-                self.height.unwrap_or_default(),
-                format_float(self.refresh_rate.unwrap_or_default())
-            ));
-        }
+    fn best_mode_for_request(&self, requested: &ModeRequest) -> Option<ParsedMode> {
+        let active_candidate = match (self.width, self.height, self.refresh_rate) {
+            (Some(width), Some(height), Some(refresh_hz))
+                if mode_matches_request(width, height, refresh_hz, requested) =>
+            {
+                Some(ParsedMode {
+                    width,
+                    height,
+                    refresh_hz,
+                })
+            }
+            _ => None,
+        };
 
         self.available_modes
             .as_ref()
@@ -400,11 +400,16 @@ impl HyprlandMonitorJson {
             .flatten()
             .filter_map(|mode| parse_mode(mode))
             .filter(|mode| mode.matches_request(requested))
+            .chain(active_candidate)
             .min_by(|left, right| {
                 (left.refresh_hz - requested.refresh_hz)
                     .abs()
                     .total_cmp(&(right.refresh_hz - requested.refresh_hz).abs())
             })
+    }
+
+    fn mode_label_for_request(&self, requested: &ModeRequest) -> Option<String> {
+        self.best_mode_for_request(requested)
             .map(|mode| mode.label())
     }
 }
@@ -461,7 +466,13 @@ fn parse_mode(mode: &str) -> Option<ParsedMode> {
 fn mode_matches_request(width: u32, height: u32, refresh_hz: f64, requested: &ModeRequest) -> bool {
     width == requested.width
         && height == requested.height
-        && (refresh_hz - requested.refresh_hz).abs() <= 0.5
+        && (refresh_hz - requested.refresh_hz).abs() <= REQUEST_REFRESH_TOLERANCE_HZ
+}
+
+fn active_matches_target(actual: &RuntimeModeActual, target: &ParsedMode) -> bool {
+    actual.width == target.width
+        && actual.height == target.height
+        && (actual.refresh_hz - target.refresh_hz).abs() <= EXACT_REFRESH_TOLERANCE_HZ
 }
 
 fn format_float(value: f64) -> String {
@@ -569,7 +580,11 @@ mod tests {
 
     #[test]
     fn mode_polling_waits_through_transient_old_and_missing_states() {
-        let requested = ModeRequest::new(1280, 1080, 239.76);
+        let target = ParsedMode {
+            width: 1280,
+            height: 1080,
+            refresh_hz: 239.76,
+        };
         let mut reads = vec![
             Some(RuntimeModeActual {
                 width: 1920,
@@ -586,7 +601,7 @@ mod tests {
         .into_iter();
         let mut calls = 0;
 
-        let actual = poll_requested_mode(&requested, 5, Duration::ZERO, || {
+        let actual = poll_target_mode(&target, 5, Duration::ZERO, || {
             calls += 1;
             Ok(reads.next().flatten())
         })
@@ -598,8 +613,12 @@ mod tests {
 
     #[test]
     fn mode_polling_returns_latest_mismatch_after_timeout() {
-        let requested = ModeRequest::new(1280, 1080, 239.76);
-        let actual = poll_requested_mode(&requested, 3, Duration::ZERO, || {
+        let target = ParsedMode {
+            width: 1280,
+            height: 1080,
+            refresh_hz: 239.76,
+        };
+        let actual = poll_target_mode(&target, 3, Duration::ZERO, || {
             Ok(Some(RuntimeModeActual {
                 width: 1920,
                 height: 1080,
@@ -609,6 +628,77 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual.unwrap().width, 1920);
+    }
+
+    #[test]
+    fn switching_between_ntsc_and_integer_refresh_does_not_alias_active_mode() {
+        let monitor = HyprlandMonitorJson {
+            name: "DP-1".to_string(),
+            width: Some(1920),
+            height: Some(1080),
+            refresh_rate: Some(59.94),
+            x: Some(0),
+            y: Some(0),
+            scale: Some(1.0),
+            available_modes: Some(vec![
+                "1920x1080@59.94Hz".to_string(),
+                "1920x1080@60.00Hz".to_string(),
+                "1920x1080@23.98Hz".to_string(),
+                "1920x1080@24.00Hz".to_string(),
+            ]),
+        };
+
+        let request_60 = ModeRequest::new(1920, 1080, 60.0);
+        let target_60 = monitor
+            .best_mode_for_request(&request_60)
+            .expect("60Hz mode should be found");
+        assert_eq!(target_60.label(), "1920x1080@60");
+        assert!(!active_matches_target(&monitor.actual_mode(), &target_60));
+
+        let inspection = ModeInspection {
+            requested: request_60,
+            active: Some(monitor.actual_mode()),
+            available_mode: Some(target_60.label()),
+            monitor_rule: Some(monitor.monitor_rule("DP-1", &target_60.label())),
+        };
+        assert!(inspection.is_available());
+        assert!(!inspection.active_matches());
+
+        let mut reads = vec![
+            Some(RuntimeModeActual {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 59.94,
+            }),
+            Some(RuntimeModeActual {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.001,
+            }),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        let actual = poll_target_mode(&target_60, 4, Duration::ZERO, || {
+            calls += 1;
+            Ok(reads.next().flatten())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!((actual.refresh_hz - 60.001).abs() < 1e-6);
+
+        let target_24 = monitor
+            .best_mode_for_request(&ModeRequest::new(1920, 1080, 24.0))
+            .expect("24Hz mode should be found");
+        assert_eq!(target_24.label(), "1920x1080@24");
+        assert!(!active_matches_target(
+            &RuntimeModeActual {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 23.976,
+            },
+            &target_24
+        ));
     }
 
     #[test]
