@@ -73,6 +73,7 @@ impl ScriptFixture {
 load_config() {
     ESP_PATH="$TEST_ROOT/boot"
     ENABLE_UKI="$TEST_UKI"
+    CUSTOM_UKI_NAME="${TEST_CUSTOM_UKI_NAME:-}"
     MKINITCPIO_FALLBACK="$TEST_FALLBACK"
 }
 check_boot_partition() { return 0; }
@@ -1126,4 +1127,397 @@ fn script_failures_never_use_pkexec_reserved_exit_codes() {
         );
         assert_eq!(fixture.boot(), before);
     }
+}
+
+#[test]
+fn kernel_cmdline_preserves_backslashes_without_awk_escape_corruption() {
+    let fixture = ScriptFixture::new();
+    let cmdline = r#"root=UUID=test initrd=\intel-ucode.img acpi_osi="Windows 2020" foo=a\nb"#;
+    fs::write(fixture.dir.join("kernel-cmdline"), cmdline).unwrap();
+    success(&fixture.run(false));
+    let config = fs::read_to_string(fixture.dir.join("default.conf")).unwrap();
+    let line = config
+        .lines()
+        .find(|line| line.starts_with("KERNEL_CMDLINE[linux-test]="))
+        .unwrap();
+    assert!(line.contains(r"initrd=\intel-ucode.img"), "{line}");
+    assert!(line.contains(r"foo=a\nb"), "{line}");
+    assert_eq!(
+        config
+            .lines()
+            .filter(|line| line.starts_with("KERNEL_CMDLINE[linux-test]="))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn boot_recovery_and_rollback_do_not_require_posix_mode_preservation_on_vfat() {
+    let fixture = ScriptFixture::new();
+    let before = fixture.boot();
+    // Simulate vfat refusing cp -a / --preserve=all onto the boot root.
+    fixture.command(
+        "cp",
+        r#"
+has_archive=0
+for arg in "$@"; do
+    case "$arg" in
+        -a|--archive) has_archive=1 ;;
+    esac
+done
+last="${!#}"
+if [ "$has_archive" -eq 1 ] && [[ "$last" == "$TEST_ROOT/boot"* ]]; then
+    echo "cp: failed to preserve ownership on vfat" >&2
+    exit 1
+fi
+exec /usr/bin/cp "$@"
+"#,
+    );
+    success(&fixture.run(false));
+    fs::write(fixture.dir.join("fail-after-install"), "").unwrap();
+    let before_fail = fixture.boot();
+    assert!(!fixture.run(false).status.success());
+    assert_eq!(fixture.boot(), before_fail);
+    assert_ne!(before, before_fail);
+}
+
+#[test]
+fn vendor_and_untouched_configs_are_not_polluted_with_bak_files() {
+    let fixture = ScriptFixture::new();
+    let vendor = fixture.dir.join("vendor");
+    fs::create_dir_all(&vendor).unwrap();
+    let vendor_conf = vendor.join("10-vendor.conf");
+    fs::write(&vendor_conf, "KERNEL_CMDLINE[default]+=quiet\n").unwrap();
+    // Make vendor dir read-only to prove drmcru never writes into /usr/share.
+    fs::set_permissions(&vendor, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = fixture.run(false);
+    // Restore permissions before Drop removes the fixture.
+    fs::set_permissions(&vendor, fs::Permissions::from_mode(0o755)).unwrap();
+    success(&output);
+
+    let root_baks: Vec<_> = fs::read_dir(&fixture.dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".drmcru.") && name.ends_with(".bak"))
+        .collect();
+    assert!(
+        !root_baks
+            .iter()
+            .any(|name| name.starts_with("mkinitcpio.conf.")),
+        "untouched mkinitcpio.conf should not get a .bak file: {root_baks:?}"
+    );
+    assert!(
+        fs::read_dir(&vendor)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".bak"))
+    );
+
+    // Failed run should clean up rollback .bak files after clean restoration.
+    fs::write(fixture.dir.join("fail-after-install"), "").unwrap();
+    let baks_before = count_bak_files(&fixture.dir);
+    assert!(!fixture.run(false).status.success());
+    assert_eq!(count_bak_files(&fixture.dir), baks_before);
+}
+
+fn count_bak_files(root: &Path) -> usize {
+    let mut total = 0;
+    for entry in fs::read_dir(root).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() && !path.is_symlink() {
+            total += count_bak_files(&path);
+        } else if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains(".drmcru."))
+        {
+            total += 1;
+        }
+    }
+    total
+}
+
+#[test]
+fn edid_source_symlinks_and_hash_mismatches_are_rejected() {
+    let fixture = ScriptFixture::new();
+    let real = fixture.dir.join("real.bin");
+    fs::write(&real, b"real-edid").unwrap();
+    fs::remove_file(fixture.dir.join("source.bin")).unwrap();
+    symlink(&real, fixture.dir.join("source.bin")).unwrap();
+    let output = fixture.run(false);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("regular file"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let fixture = ScriptFixture::new();
+    let mut plan = sample_plan();
+    plan.edid_source = fixture.dir.join("source.bin");
+    let mut script = build_install_script_with_sha256(&plan, &"0".repeat(64));
+    for (variable, original, relative) in [
+        ("MKINITCPIO_BIN", "/usr/bin/mkinitcpio", "bin/mkinitcpio"),
+        ("LSINITCPIO_BIN", "/usr/bin/lsinitcpio", "bin/lsinitcpio"),
+        (
+            "ENTRY_TOOL_BIN",
+            "/usr/bin/limine-entry-tool",
+            "bin/limine-entry-tool",
+        ),
+        ("OBJCOPY_BIN", "/usr/bin/objcopy", "bin/objcopy"),
+        ("FIRMWARE_ROOT", "/lib/firmware", "firmware-root"),
+        ("BOOT_ROOT", "/boot", "boot"),
+        ("MKINIT", "/etc/mkinitcpio.conf", "mkinitcpio.conf"),
+        (
+            "LIMINE_DROPIN_DIR",
+            "/etc/limine-entry-tool.d",
+            "entry-tool",
+        ),
+        (
+            "LIMINE_CONFIG",
+            "/etc/limine-entry-tool.conf",
+            "entry-base.conf",
+        ),
+        (
+            "LIMINE_DEFAULT_CONFIG",
+            "/etc/default/limine",
+            "default.conf",
+        ),
+        (
+            "LIMINE_VENDOR_DIR",
+            "/usr/share/limine-entry-tool.d",
+            "vendor",
+        ),
+        (
+            "LIMINE_FUNCTIONS",
+            "/usr/lib/limine/limine-common-functions",
+            "common-functions",
+        ),
+        ("BOOT_HOOKS", "/etc/boot/hooks", "hooks"),
+        (
+            "BOOT_LOCK",
+            "/run/lock/boot-partition.lock",
+            "locks/boot.lock",
+        ),
+        (
+            "PACKAGE_LOCK",
+            "/var/lib/pacman/db.lck",
+            "locks/package.lock",
+        ),
+        ("TRANSACTION_ROOT", "/var/tmp", "tmp"),
+        ("MODULES_ROOT", "/usr/lib/modules", "modules"),
+        ("MACHINE_ID_FILE", "/etc/machine-id", "machine-id"),
+        ("DRM_ROOT", "/sys/class/drm", "drm"),
+    ] {
+        script = script.replace(
+            &format!("{variable}=\"{original}\""),
+            &format!(
+                "{variable}={}",
+                shell_quote(&fixture.dir.join(relative).display().to_string())
+            ),
+        );
+    }
+    let output = Command::new("bash")
+        .args(["-c", &script])
+        .env("TEST_ROOT", &fixture.dir)
+        .env("TEST_UKI", "no")
+        .env("TEST_FALLBACK", "no")
+        .env("TEST_NO_EMBED", "no")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.dir.join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("changed during authorization"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.firmware().exists());
+}
+
+#[test]
+fn mkinitcpio_dropin_symlink_to_regular_file_is_rejected_early() {
+    let fixture = ScriptFixture::new();
+    let target = fixture.dir.join("target.conf");
+    fs::write(&target, "FILES=()\n").unwrap();
+    fs::create_dir_all(fixture.dir.join("mkinitcpio.conf.d")).unwrap();
+    symlink(&target, fixture.mkinitcpio_dropin()).unwrap();
+    let output = fixture.run(false);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("regular configuration file"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn uki_prefix_matches_limine_fallback_and_valid_custom_names() {
+    let setup_uki_only_boot = |fixture: &ScriptFixture, prefix: &str| {
+        let legacy_dir = fixture.dir.join(format!("boot/{MACHINE}"));
+        if legacy_dir.exists() {
+            fs::remove_dir_all(&legacy_dir).unwrap();
+        }
+        let uki_dir = fixture.dir.join("boot/EFI/Linux");
+        fs::create_dir_all(&uki_dir).unwrap();
+        fs::write(uki_dir.join(format!("{prefix}_linux-test.efi")), b"old-uki").unwrap();
+        fs::write(
+            fixture.dir.join("boot/limine.conf"),
+            format!(
+                "/linux-test\n  protocol: efi\n  path: boot():/EFI/Linux/{prefix}_linux-test.efi\n  cmdline: {BASE_ARGS}\n"
+            ),
+        )
+        .unwrap();
+    };
+
+    // Invalid CUSTOM_UKI_NAME (hyphens/underscores): Limine falls back to MACHINE_ID.
+    let fixture = ScriptFixture::new();
+    setup_uki_only_boot(&fixture, MACHINE);
+    let install = fixture.run_options(
+        false,
+        "DP-1",
+        &[
+            ("TEST_UKI", "yes"),
+            ("TEST_CUSTOM_UKI_NAME", "arch-linux_1"),
+        ],
+    );
+    success(&install);
+    assert!(
+        String::from_utf8_lossy(&install.stderr).contains("Ignoring invalid CUSTOM_UKI_NAME"),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(
+        fixture
+            .dir
+            .join(format!("boot/EFI/Linux/{MACHINE}_linux-test.efi"))
+            .is_file()
+    );
+    assert!(
+        fixture
+            .dir
+            .join("boot/drmcru-recovery/0-00000000000000000000000000000000_linux-test.efi")
+            .is_file()
+    );
+    success(&fixture.run_options(
+        true,
+        "DP-1",
+        &[
+            ("TEST_UKI", "yes"),
+            ("TEST_CUSTOM_UKI_NAME", "arch-linux_1"),
+        ],
+    ));
+
+    // Valid lowercase alphanumeric CUSTOM_UKI_NAME: used directly by Limine and drmcru.
+    let fixture = ScriptFixture::new();
+    setup_uki_only_boot(&fixture, "omarchy");
+    success(&fixture.run_options(
+        false,
+        "DP-1",
+        &[("TEST_UKI", "yes"), ("TEST_CUSTOM_UKI_NAME", "omarchy")],
+    ));
+    assert!(
+        fixture
+            .dir
+            .join("boot/EFI/Linux/omarchy_linux-test.efi")
+            .is_file()
+    );
+    assert!(
+        fixture
+            .dir
+            .join("boot/drmcru-recovery/0-omarchy_linux-test.efi")
+            .is_file()
+    );
+    success(&fixture.run_options(
+        true,
+        "DP-1",
+        &[("TEST_UKI", "yes"), ("TEST_CUSTOM_UKI_NAME", "omarchy")],
+    ));
+
+    // Uppercase hex MACHINE_ID with no CUSTOM_UKI_NAME is preserved without rejection.
+    let upper_id = "0123456789ABCDEF0123456789ABCDEF";
+    let fixture = ScriptFixture::new();
+    fs::write(fixture.dir.join("machine-id"), format!("{upper_id}\n")).unwrap();
+    setup_uki_only_boot(&fixture, upper_id);
+    success(&fixture.run_options(false, "DP-1", &[("TEST_UKI", "yes")]));
+    assert!(
+        fixture
+            .dir
+            .join(format!("boot/EFI/Linux/{upper_id}_linux-test.efi"))
+            .is_file()
+    );
+}
+
+#[test]
+fn protected_limine_config_defers_override_verification_cleanly() {
+    let mut warnings = Vec::new();
+    let stats = limine_cmdline_reference_stats_read(
+        Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        Path::new("/boot/limine.conf"),
+        "drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin",
+        "bootloader config",
+        &mut warnings,
+    );
+    assert_eq!(stats, (0, 0, false, true));
+    assert!(warnings.is_empty());
+
+    let status = InstalledOverrideStatus {
+        connector: "DP-1".to_string(),
+        edid_file_name: "drmcru_custom_DP-1.bin".to_string(),
+        kernel_parameter: "drm.edid_firmware=DP-1:edid/drmcru_custom_DP-1.bin".to_string(),
+        firmware_target: PathBuf::from("/lib/firmware/edid/drmcru_custom_DP-1.bin"),
+        firmware_present: true,
+        mkinitcpio_references_firmware: true,
+        bootloader_references_kernel_parameter: false,
+        bootloader_validation_deferred: true,
+        limine_entry_tool_references_kernel_parameter: true,
+        bootloader_cmdline_entries: 0,
+        bootloader_cmdline_entries_with_kernel_parameter: 0,
+        active_kernel_references_kernel_parameter: false,
+        read_warnings: warnings,
+    };
+    assert!(status.is_configured_for_next_boot());
+    assert_eq!(status.short_label(), "installed, reboot pending");
+}
+
+#[test]
+fn mkinitcpio_reference_check_ignores_comments_and_suffix_matches() {
+    let target = "/lib/firmware/edid/drmcru_custom_DP-1.bin";
+    assert!(!text_references_mkinitcpio_firmware(
+        "# FILES=(\"/lib/firmware/edid/drmcru_custom_DP-1.bin\")\n",
+        target
+    ));
+    assert!(!text_references_mkinitcpio_firmware(
+        "FILES=(\"/lib/firmware/edid/drmcru_custom_DP-1.bin.bak\")\n",
+        target
+    ));
+    assert!(text_references_mkinitcpio_firmware(
+        "FILES+=(\"/lib/firmware/edid/drmcru_custom_DP-1.bin\")\n",
+        target
+    ));
+}
+
+#[test]
+fn sha256_and_staged_edid_file_work() {
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    let staged = stage_temp_edid(b"edid-bytes").unwrap();
+    let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(fs::read(&staged).unwrap(), b"edid-bytes");
+    fs::remove_file(&staged).unwrap();
 }

@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const MKINITCPIO_DROPIN: &str = "/etc/mkinitcpio.conf.d/20-drmcru.conf";
+const MAX_EDID_BYTES: u64 = 256 * 128;
 
 /// Describes everything needed to install a custom EDID into the system.
 #[derive(Debug, Clone)]
@@ -76,6 +77,7 @@ pub struct InstalledOverrideStatus {
     pub firmware_present: bool,
     pub mkinitcpio_references_firmware: bool,
     pub bootloader_references_kernel_parameter: bool,
+    pub bootloader_validation_deferred: bool,
     pub limine_entry_tool_references_kernel_parameter: bool,
     pub bootloader_cmdline_entries: usize,
     pub bootloader_cmdline_entries_with_kernel_parameter: usize,
@@ -260,9 +262,14 @@ impl InstalledOverrideStatus {
 
     pub fn is_configured_for_next_boot(&self) -> bool {
         self.firmware_present
-            && self.bootloader_cmdline_entries > 0
-            && self.bootloader_cmdline_entries
-                == self.bootloader_cmdline_entries_with_kernel_parameter
+            && if self.bootloader_validation_deferred {
+                self.mkinitcpio_references_firmware
+                    && self.limine_entry_tool_references_kernel_parameter
+            } else {
+                self.bootloader_cmdline_entries > 0
+                    && self.bootloader_cmdline_entries
+                        == self.bootloader_cmdline_entries_with_kernel_parameter
+            }
     }
 
     pub fn short_label(&self) -> &'static str {
@@ -364,8 +371,10 @@ pub struct InstallReport {
 
 #[derive(Debug, Error)]
 pub enum InstallError {
-    #[error("EDID source file does not exist: {0}")]
+    #[error("EDID source file does not exist or is invalid: {0}")]
     MissingEdid(PathBuf),
+    #[error("failed to read or stage EDID file: {0}")]
+    EdidIo(io::Error),
     #[error("unsafe firmware file name: {0}")]
     UnsafeFirmwareName(String),
     #[error("failed to write privileged script: {0}")]
@@ -402,6 +411,10 @@ pub fn inspect_system_support() -> SystemSupportReport {
         "pacman",
         "flock",
         "b2sum",
+        "sha256sum",
+        "realpath",
+        "diff",
+        "findmnt",
     ] {
         if !command_exists(command) {
             report.read_warnings.push(format!("{command} is required for verified automatic installation; manual Export remains available"));
@@ -543,13 +556,13 @@ fn inspect_override_with_paths(
     let mut read_warnings = Vec::new();
     let firmware_present =
         path_exists(paths.firmware_target, "firmware target", &mut read_warnings);
-    let legacy_mkinitcpio_reference = file_contains(
+    let legacy_mkinitcpio_reference = file_references_mkinitcpio_firmware(
         paths.mkinitcpio_conf,
         &paths.firmware_target.display().to_string(),
         "mkinitcpio config",
         &mut read_warnings,
     );
-    let dropin_mkinitcpio_reference = file_contains(
+    let dropin_mkinitcpio_reference = file_references_mkinitcpio_firmware(
         paths.mkinitcpio_dropin,
         &paths.firmware_target.display().to_string(),
         "mkinitcpio drop-in",
@@ -560,6 +573,7 @@ fn inspect_override_with_paths(
         bootloader_cmdline_entries,
         bootloader_cmdline_entries_with_kernel_parameter,
         bootloader_references_kernel_parameter,
+        bootloader_validation_deferred,
     ) = limine_cmdline_reference_stats(
         paths.bootloader_conf,
         kernel_parameter,
@@ -587,6 +601,7 @@ fn inspect_override_with_paths(
         firmware_present,
         mkinitcpio_references_firmware,
         bootloader_references_kernel_parameter,
+        bootloader_validation_deferred,
         limine_entry_tool_references_kernel_parameter,
         bootloader_cmdline_entries,
         bootloader_cmdline_entries_with_kernel_parameter,
@@ -609,9 +624,14 @@ fn path_exists(path: &Path, label: &str, warnings: &mut Vec<String>) -> bool {
     }
 }
 
-fn file_contains(path: &Path, needle: &str, label: &str, warnings: &mut Vec<String>) -> bool {
+fn file_references_mkinitcpio_firmware(
+    path: &Path,
+    target: &str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
     match fs::read_to_string(path) {
-        Ok(contents) => contents.contains(needle),
+        Ok(contents) => text_references_mkinitcpio_firmware(&contents, target),
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => {
             warnings.push(format!(
@@ -621,6 +641,17 @@ fn file_contains(path: &Path, needle: &str, label: &str, warnings: &mut Vec<Stri
             false
         }
     }
+}
+
+fn text_references_mkinitcpio_firmware(contents: &str, target: &str) -> bool {
+    contents.lines().any(|line| {
+        let uncommented = line.split('#').next().unwrap_or_default();
+        uncommented
+            .split(|character: char| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | '(' | ')' | ';')
+            })
+            .any(|token| token == target)
+    })
 }
 
 fn file_contains_kernel_mapping(
@@ -659,8 +690,18 @@ fn limine_cmdline_reference_stats(
     needle: &str,
     label: &str,
     warnings: &mut Vec<String>,
-) -> (usize, usize, bool) {
-    match fs::read_to_string(path) {
+) -> (usize, usize, bool, bool) {
+    limine_cmdline_reference_stats_read(fs::read_to_string(path), path, needle, label, warnings)
+}
+
+fn limine_cmdline_reference_stats_read(
+    result: io::Result<String>,
+    path: &Path,
+    needle: &str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> (usize, usize, bool, bool) {
+    match result {
         Ok(contents) => {
             let mut cmdlines = 0;
             let mut matching = 0;
@@ -683,15 +724,16 @@ fn limine_cmdline_reference_stats(
                     }
                 }
             }
-            (cmdlines, matching, matching > 0)
+            (cmdlines, matching, matching > 0, false)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (0, 0, false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (0, 0, false, false),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => (0, 0, false, true),
         Err(error) => {
             warnings.push(format!(
                 "Could not read {label} {}: {error}",
                 path.display()
             ));
-            (0, 0, false)
+            (0, 0, false, false)
         }
     }
 }
@@ -775,19 +817,38 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 /// Generate the shared, verified boot transaction for either operation.
+#[cfg(test)]
 pub fn build_install_script(plan: &InstallPlan) -> String {
+    let edid_sha256 = read_install_edid(&plan.edid_source)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
     build_override_script(
         &plan.connector,
         &plan.edid_file_name,
         Some(&plan.edid_source),
+        edid_sha256.as_deref(),
+    )
+}
+
+fn build_install_script_with_sha256(plan: &InstallPlan, edid_sha256: &str) -> String {
+    build_override_script(
+        &plan.connector,
+        &plan.edid_file_name,
+        Some(&plan.edid_source),
+        Some(edid_sha256),
     )
 }
 
 pub fn build_uninstall_script(plan: &UninstallPlan) -> String {
-    build_override_script(&plan.connector, &plan.edid_file_name, None)
+    build_override_script(&plan.connector, &plan.edid_file_name, None, None)
 }
 
-fn build_override_script(connector: &str, name: &str, source: Option<&Path>) -> String {
+fn build_override_script(
+    connector: &str,
+    name: &str,
+    source: Option<&Path>,
+    edid_sha256: Option<&str>,
+) -> String {
     let connector = shell_quote(connector);
     let name = shell_quote(name);
     let operation = if source.is_some() { "add" } else { "remove" };
@@ -796,8 +857,8 @@ fn build_override_script(connector: &str, name: &str, source: Option<&Path>) -> 
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
     );
+    let edid_sha256 = shell_quote(edid_sha256.unwrap_or_default());
     let files_awk = shell_quote(include_str!("mkinitcpio_files.awk"));
-    let preset_awk = shell_quote(include_str!("mkinitcpio_preset_config.awk"));
     let cmdline_awk = shell_quote(include_str!("kernel_cmdline.awk"));
     let entry_awk = shell_quote(include_str!("limine_entry.awk"));
     let mkinit_helpers = include_str!("mkinitcpio_dropin.sh");
@@ -808,6 +869,7 @@ OPERATION={operation}
 CONNECTOR={connector}
 EDID_NAME={name}
 EDID_SOURCE={source}
+EDID_SHA256={edid_sha256}
 MKINITCPIO_BIN="/usr/bin/mkinitcpio"
 LSINITCPIO_BIN="/usr/bin/lsinitcpio"
 ENTRY_TOOL_BIN="/usr/bin/limine-entry-tool"
@@ -833,7 +895,6 @@ MODULES_ROOT="/usr/lib/modules"
 MACHINE_ID_FILE="/etc/machine-id"
 DRM_ROOT="/sys/class/drm"
 FILES_AWK={files_awk}
-PRESET_CONFIG_AWK={preset_awk}
 CMDLINE_AWK={cmdline_awk}
 ENTRY_AWK={entry_awk}
 {mkinit_helpers}
@@ -846,16 +907,12 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Run the install. Returns a report on success, or an error.
-pub fn install(plan: &InstallPlan) -> Result<InstallReport, InstallError> {
-    validate_firmware_file_name(&plan.edid_file_name)?;
+pub(crate) fn validate_system_connector_mapping(connector: &str) -> Result<(), String> {
     let names = fs::read_dir("/sys/class/drm")
-        .map_err(|error| {
-            InstallError::UnsupportedSystem(format!("Could not inspect DRM connectors: {error}"))
-        })?
+        .map_err(|error| format!("Could not inspect DRM connectors: {error}"))?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<Vec<_>>>()
-        .map_err(|error| InstallError::UnsupportedSystem(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     let connectors = names
         .iter()
         .filter(|path| path.join("status").exists())
@@ -865,20 +922,100 @@ pub fn install(plan: &InstallPlan) -> Result<InstallReport, InstallError> {
                 .split_once('-')
                 .map(|(_, name)| name)
         });
-    validate_connector_mapping(&plan.connector, connectors)
-        .map_err(InstallError::UnsupportedSystem)?;
+    validate_connector_mapping(connector, connectors)
+}
 
-    // Validate source exists
-    if !plan.edid_source.exists() {
-        return Err(InstallError::MissingEdid(plan.edid_source.clone()));
+pub fn stage_temp_edid(bytes: &[u8]) -> Result<PathBuf, InstallError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let mut last_error = None;
+
+    for attempt in 0..100 {
+        let path = std::env::temp_dir().join(format!("drmcru-edid-{pid}-{now}-{attempt}.bin"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes) {
+                    let _ = fs::remove_file(&path);
+                    return Err(InstallError::EdidIo(error));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(InstallError::EdidIo(error)),
+        }
     }
+
+    Err(InstallError::EdidIo(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create unique staged EDID file",
+        )
+    })))
+}
+
+fn read_install_edid(path: &Path) -> io::Result<Vec<u8>> {
+    let link_meta = fs::symlink_metadata(path)?;
+    if link_meta.file_type().is_symlink() || !link_meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EDID source must be a regular file, not a symlink or special file",
+        ));
+    }
+    if link_meta.len() == 0 || link_meta.len() > MAX_EDID_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("EDID source must be 1..={MAX_EDID_BYTES} bytes"),
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_EDID_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EDID source changed to an invalid file",
+        ));
+    }
+    let mut raw = Vec::new();
+    file.take(MAX_EDID_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.is_empty() || raw.len() as u64 > MAX_EDID_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EDID source size is invalid",
+        ));
+    }
+    Ok(raw)
+}
+
+/// Run the install. Returns a report on success, or an error.
+pub fn install(plan: &InstallPlan) -> Result<InstallReport, InstallError> {
+    validate_firmware_file_name(&plan.edid_file_name)?;
+    validate_system_connector_mapping(&plan.connector).map_err(InstallError::UnsupportedSystem)?;
+
+    let edid_bytes = read_install_edid(&plan.edid_source).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            InstallError::MissingEdid(plan.edid_source.clone())
+        } else {
+            InstallError::EdidIo(error)
+        }
+    })?;
+    let edid_sha256 = sha256_hex(&edid_bytes);
 
     let support = inspect_system_support();
     if !support.is_supported() {
         return Err(InstallError::UnsupportedSystem(support.report_text()));
     }
 
-    run_privileged_script(&build_install_script(plan))
+    run_privileged_script(&build_install_script_with_sha256(plan, &edid_sha256))
 }
 
 /// Run the uninstall. Returns a report on success, or an error.
@@ -993,8 +1130,10 @@ fn write_temp_install_script(script: &str) -> Result<PathBuf, InstallError> {
             .open(&path)
         {
             Ok(mut file) => {
-                file.write_all(script.as_bytes())
-                    .map_err(InstallError::ScriptWrite)?;
+                if let Err(error) = file.write_all(script.as_bytes()) {
+                    let _ = fs::remove_file(&path);
+                    return Err(InstallError::ScriptWrite(error));
+                }
                 return Ok(path);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -1010,6 +1149,80 @@ fn write_temp_install_script(script: &str) -> Result<PathBuf, InstallError> {
             "could not create unique temporary install script",
         )
     })))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((data.len() + 9).div_ceil(64) * 64);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in padded.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (index, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[index] = u32::from_be_bytes(*chunk);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, delta) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(delta);
+        }
+    }
+
+    let mut hex = String::with_capacity(64);
+    for word in state {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{word:08x}");
+    }
+    hex
 }
 
 #[cfg(test)]

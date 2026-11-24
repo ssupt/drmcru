@@ -1,7 +1,11 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+
+const MAX_CONFIG_FILES_READ: usize = 256;
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorRule {
@@ -50,16 +54,20 @@ pub struct MonitorRuleInspection {
     pub connector_rules: Vec<MonitorRule>,
     pub exact_match: Option<MonitorRule>,
     pub last_connector_rule: Option<MonitorRule>,
+    pub uncertain_override: Option<String>,
     pub read_warnings: Vec<String>,
 }
 
 impl MonitorRuleInspection {
     pub fn exact_match_is_effective(&self) -> bool {
-        self.exact_match.as_ref().is_some_and(|exact| {
-            self.last_connector_rule.as_ref().is_some_and(|last| {
-                exact.path == last.path && exact.line_number == last.line_number
+        self.uncertain_override.is_none()
+            && self.exact_match.as_ref().is_some_and(|exact| {
+                self.last_connector_rule.as_ref().is_some_and(|last| {
+                    exact.path == last.path
+                        && exact.line_number == last.line_number
+                        && exact.normalized_rule() == last.normalized_rule()
+                })
             })
-        })
     }
 }
 
@@ -118,21 +126,41 @@ fn inspect_monitor_rule_from(
 
     let normalized_expected = normalize_monitor_rule(expected_rule);
 
-    let connector_rules = parser
-        .monitor_rules
-        .into_iter()
-        .filter(|rule| rule.connector == connector)
-        .collect::<Vec<_>>();
-    let exact_match = connector_rules
-        .iter()
-        .rev()
-        .find(|rule| {
-            normalized_expected
+    let mut connector_rules = Vec::new();
+    let mut last_exact_entry_index = None;
+    let mut exact_match = None;
+    for (index, entry) in parser.entries.iter().enumerate() {
+        if let MonitorEntry::Literal(rule) = entry
+            && rule.connector == connector
+        {
+            if normalized_expected
                 .as_ref()
                 .is_some_and(|expected| rule.normalized_rule() == *expected)
-        })
-        .cloned();
+            {
+                last_exact_entry_index = Some(index);
+                exact_match = Some(rule.clone());
+            }
+            connector_rules.push(rule.clone());
+        }
+    }
     let last_connector_rule = connector_rules.last().cloned();
+    let uncertain_override = last_exact_entry_index.and_then(|exact_index| {
+        parser.entries[exact_index + 1..]
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                MonitorEntry::Dynamic {
+                    connector: dynamic_connector,
+                    location,
+                } if dynamic_connector
+                    .as_deref()
+                    .is_none_or(|name| name == connector) =>
+                {
+                    Some(location.clone())
+                }
+                _ => None,
+            })
+    });
 
     MonitorRuleInspection {
         root_path,
@@ -141,6 +169,7 @@ fn inspect_monitor_rule_from(
         connector_rules,
         exact_match,
         last_connector_rule,
+        uncertain_override,
         read_warnings: parser.read_warnings,
     }
 }
@@ -173,14 +202,54 @@ fn lua_string(value: &str) -> String {
     )
 }
 
+enum MonitorEntry {
+    Literal(MonitorRule),
+    Dynamic {
+        connector: Option<String>,
+        location: String,
+    },
+}
+
+enum LuaMonitorParse {
+    Literal(MonitorRule),
+    Dynamic {
+        connector: Option<String>,
+        line_number: usize,
+    },
+}
+
 #[derive(Default)]
 struct ConfigParser {
     // Only active includes are guarded; source/dofile can load a file again.
     seen: BTreeSet<PathBuf>,
     required: BTreeSet<PathBuf>,
     files_read: usize,
-    monitor_rules: Vec<MonitorRule>,
+    hit_file_limit: bool,
+    entries: Vec<MonitorEntry>,
     read_warnings: Vec<String>,
+}
+
+fn read_config_text(path: &Path) -> Result<String, String> {
+    let meta = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if meta.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(format!("exceeds {MAX_CONFIG_FILE_BYTES} bytes"));
+    }
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let open_meta = file.metadata().map_err(|error| error.to_string())?;
+    if !open_meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(format!("exceeds {MAX_CONFIG_FILE_BYTES} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("invalid UTF-8: {error}"))
 }
 
 impl ConfigParser {
@@ -190,8 +259,23 @@ impl ConfigParser {
         if !self.seen.insert(seen_path.clone()) {
             return;
         }
+        if self.files_read >= MAX_CONFIG_FILES_READ {
+            if !self.hit_file_limit {
+                self.hit_file_limit = true;
+                self.read_warnings.push(format!(
+                    "Stopped reading Hyprland config includes after {MAX_CONFIG_FILES_READ} files (skipped {})",
+                    human_path(path)
+                ));
+            }
+            self.entries.push(MonitorEntry::Dynamic {
+                connector: None,
+                location: human_path(path),
+            });
+            self.seen.remove(&seen_path);
+            return;
+        }
 
-        let contents = match fs::read_to_string(path) {
+        let contents = match read_config_text(path) {
             Ok(contents) => contents,
             Err(error) => {
                 self.read_warnings
@@ -206,28 +290,64 @@ impl ConfigParser {
             for call in find_lua_calls(&contents) {
                 match call.kind {
                     LuaCallKind::Monitor => {
-                        if let Some(rule) =
-                            parse_lua_monitor_rule(&display_path, &contents, call.start, call.end)
+                        match parse_lua_monitor_call(&display_path, &contents, call.start, call.end)
                         {
-                            self.monitor_rules.push(rule);
+                            LuaMonitorParse::Literal(rule) => {
+                                self.entries.push(MonitorEntry::Literal(rule));
+                            }
+                            LuaMonitorParse::Dynamic {
+                                connector,
+                                line_number,
+                            } => {
+                                let location =
+                                    format!("{}:{line_number}", human_path(&display_path));
+                                self.read_warnings
+                                    .push(format!("Skipped dynamic monitor rule at {location}"));
+                                self.entries.push(MonitorEntry::Dynamic {
+                                    connector,
+                                    location,
+                                });
+                            }
                         }
                     }
                     LuaCallKind::DoFile => {
                         let Some(value) = parse_literal_lua_call_argument(call.raw(&contents))
                         else {
                             // Dynamic bootstrap expressions are common in Hyprland 0.56 and
-                            // Omarchy. They cannot be resolved safely without executing Lua.
+                            // Omarchy. Record their position so later dynamic includes make
+                            // earlier matches uncertain without failing top-of-file bootstraps.
+                            let line_number = line_number_at(&contents, call.start);
+                            self.entries.push(MonitorEntry::Dynamic {
+                                connector: None,
+                                location: format!("{}:{line_number}", human_path(&display_path)),
+                            });
                             continue;
                         };
-                        for source in
-                            resolve_source_paths(&value, &display_path, &mut self.read_warnings)
+                        let resolved =
+                            resolve_source_paths(&value, &display_path, &mut self.read_warnings);
+                        if resolved.is_empty()
+                            && path_contains_unsupported_glob(&PathBuf::from(expand_config_path(
+                                &value,
+                            )))
                         {
+                            let line_number = line_number_at(&contents, call.start);
+                            self.entries.push(MonitorEntry::Dynamic {
+                                connector: None,
+                                location: format!("{}:{line_number}", human_path(&display_path)),
+                            });
+                        }
+                        for source in resolved {
                             self.read_file(&source);
                         }
                     }
                     LuaCallKind::Require => {
                         let Some(module) = parse_literal_lua_call_argument(call.raw(&contents))
                         else {
+                            let line_number = line_number_at(&contents, call.start);
+                            self.entries.push(MonitorEntry::Dynamic {
+                                connector: None,
+                                location: format!("{}:{line_number}", human_path(&display_path)),
+                            });
                             continue;
                         };
                         if let Some(source) = resolve_lua_require(&module, &display_path) {
@@ -255,18 +375,35 @@ impl ConfigParser {
                     if let Some(rule) =
                         parse_monitor_rule(&display_path, line_number, raw_line, value)
                     {
-                        self.monitor_rules.push(rule);
+                        self.entries.push(MonitorEntry::Literal(rule));
                     } else if value.contains('$') {
-                        self.read_warnings.push(format!(
-                            "Skipped dynamic monitor rule at {}:{line_number}",
-                            human_path(&display_path)
-                        ));
+                        let connector = value
+                            .split(',')
+                            .next()
+                            .map(str::trim)
+                            .filter(|part| !part.is_empty() && !part.contains('$'))
+                            .map(str::to_string);
+                        let location = format!("{}:{line_number}", human_path(&display_path));
+                        self.read_warnings
+                            .push(format!("Skipped dynamic monitor rule at {location}"));
+                        self.entries.push(MonitorEntry::Dynamic {
+                            connector,
+                            location,
+                        });
                     }
                 }
                 "source" => {
-                    for source in
-                        resolve_source_paths(value, &display_path, &mut self.read_warnings)
+                    let resolved =
+                        resolve_source_paths(value, &display_path, &mut self.read_warnings);
+                    if resolved.is_empty()
+                        && path_contains_unsupported_glob(&PathBuf::from(expand_config_path(value)))
                     {
+                        self.entries.push(MonitorEntry::Dynamic {
+                            connector: None,
+                            location: format!("{}:{line_number}", human_path(&display_path)),
+                        });
+                    }
+                    for source in resolved {
                         self.read_file(&source);
                     }
                 }
@@ -303,23 +440,13 @@ fn find_lua_calls(contents: &str) -> Vec<LuaCall> {
     let mut index = 0;
 
     while index < bytes.len() {
-        if bytes[index..].starts_with(b"--[[") {
-            index = find_bytes(bytes, index + 4, b"]]")
-                .map(|end| end + 2)
-                .unwrap_or(bytes.len());
+        if let Some(end) = skip_lua_comment_body(bytes, index) {
+            index = end;
             continue;
         }
-        if bytes[index..].starts_with(b"--") {
-            index = bytes[index..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|relative| index + relative + 1)
-                .unwrap_or(bytes.len());
-            continue;
-        }
-        if bytes[index..].starts_with(b"[[") {
-            index = find_bytes(bytes, index + 2, b"]]")
-                .map(|end| end + 2)
+        if let Some((content_start, eq_count)) = lua_long_bracket_open(bytes, index) {
+            index = find_lua_long_bracket_close(bytes, content_start, eq_count)
+                .map(|close| close + eq_count + 2)
                 .unwrap_or(bytes.len());
             continue;
         }
@@ -336,7 +463,9 @@ fn find_lua_calls(contents: &str) -> Vec<LuaCall> {
         .into_iter()
         .find(|(name, _)| {
             bytes[index..].starts_with(name)
-                && (index == 0 || !is_lua_identifier_byte(bytes[index - 1]))
+                && (index == 0
+                    || (!is_lua_identifier_byte(bytes[index - 1])
+                        && !matches!(bytes[index - 1], b'.' | b':')))
                 && bytes
                     .get(index + name.len())
                     .is_none_or(|byte| !is_lua_identifier_byte(*byte))
@@ -346,16 +475,39 @@ fn find_lua_calls(contents: &str) -> Vec<LuaCall> {
             index += 1;
             continue;
         };
-        let mut open = index + name.len();
-        while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
-            open += 1;
-        }
-        if bytes.get(open) != Some(&b'(') {
+        let open = skip_lua_whitespace_and_comments(bytes, index + name.len());
+        let call_end = match bytes.get(open) {
+            Some(&b'(') => match find_balanced_lua_delim(contents, open, b'(', b')') {
+                Some(end) => Some(end),
+                None => break,
+            },
+            Some(&b'{') if kind == LuaCallKind::Monitor => {
+                match find_balanced_lua_delim(contents, open, b'{', b'}') {
+                    Some(end) => Some(end),
+                    None => break,
+                }
+            }
+            Some(&(b'\'' | b'"')) if matches!(kind, LuaCallKind::DoFile | LuaCallKind::Require) => {
+                match find_quoted_lua_string_end(bytes, open) {
+                    Some(end) => Some(end),
+                    None => break,
+                }
+            }
+            Some(&b'[') if matches!(kind, LuaCallKind::DoFile | LuaCallKind::Require) => {
+                if let Some((content_start, eq_count)) = lua_long_bracket_open(bytes, open) {
+                    match find_lua_long_bracket_close(bytes, content_start, eq_count) {
+                        Some(close) => Some(close + eq_count + 1),
+                        None => break,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some(end) = call_end else {
             index += name.len();
             continue;
-        }
-        let Some(end) = find_balanced_lua_call(contents, open) else {
-            break;
         };
         calls.push(LuaCall {
             kind,
@@ -373,14 +525,77 @@ fn is_lua_identifier_byte(byte: u8) -> bool {
 }
 
 fn find_bytes(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
-    haystack[from..]
+    haystack
+        .get(from..)?
         .windows(needle.len())
         .position(|window| window == needle)
         .map(|relative| from + relative)
 }
 
-fn skip_quoted_lua_string(bytes: &[u8], start: usize) -> usize {
-    let quote = bytes[start];
+fn lua_long_bracket_open(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if bytes.get(start) != Some(&b'[') {
+        return None;
+    }
+    let mut index = start + 1;
+    while bytes.get(index) == Some(&b'=') {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'[') {
+        return None;
+    }
+    Some((index + 1, index - (start + 1)))
+}
+
+fn find_lua_long_bracket_close(
+    bytes: &[u8],
+    content_start: usize,
+    eq_count: usize,
+) -> Option<usize> {
+    let mut close = Vec::with_capacity(eq_count + 2);
+    close.push(b']');
+    close.resize(1 + eq_count, b'=');
+    close.push(b']');
+    find_bytes(bytes, content_start, &close)
+}
+
+fn skip_lua_comment_body(bytes: &[u8], start: usize) -> Option<usize> {
+    if !bytes.get(start..)?.starts_with(b"--") {
+        return None;
+    }
+    if let Some((content_start, eq_count)) = lua_long_bracket_open(bytes, start + 2) {
+        return Some(
+            find_lua_long_bracket_close(bytes, content_start, eq_count)
+                .map(|close| close + eq_count + 2)
+                .unwrap_or(bytes.len()),
+        );
+    }
+    Some(
+        bytes[start + 2..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|relative| start + 2 + relative)
+            .unwrap_or(bytes.len()),
+    )
+}
+
+fn skip_lua_whitespace_and_comments(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if let Some(end) = skip_lua_comment_body(bytes, index) {
+            index = end;
+        } else {
+            break;
+        }
+    }
+    index
+}
+
+fn find_quoted_lua_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = *bytes.get(start)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
     let mut index = start + 1;
     let mut escaped = false;
     while index < bytes.len() {
@@ -389,81 +604,176 @@ fn skip_quoted_lua_string(bytes: &[u8], start: usize) -> usize {
         } else if bytes[index] == b'\\' {
             escaped = true;
         } else if bytes[index] == quote {
-            return index + 1;
+            return Some(index);
         }
         index += 1;
     }
-    bytes.len()
+    None
 }
 
-fn parse_lua_monitor_rule(
+fn skip_quoted_lua_string(bytes: &[u8], start: usize) -> usize {
+    find_quoted_lua_string_end(bytes, start).map_or(bytes.len(), |end| end + 1)
+}
+
+fn line_number_at(contents: &str, start: usize) -> usize {
+    contents[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn parse_lua_monitor_call(
     path: &Path,
     contents: &str,
     start: usize,
     end: usize,
-) -> Option<MonitorRule> {
+) -> LuaMonitorParse {
     let raw = &contents[start..=end];
-    let fields = parse_lua_table_fields(raw);
-    let connector = fields.iter().find(|(key, _)| key == "output")?;
-    let mode = fields
-        .iter()
-        .find(|(key, _)| key == "mode")
-        .map(|(_, value)| value.clone())
-        .or_else(|| {
-            fields
-                .iter()
-                .any(|(key, value)| key == "disabled" && value == "true")
-                .then(|| "disabled".to_string())
-        })?;
-    Some(MonitorRule {
+    let line_number = line_number_at(contents, start);
+    let without_comments = strip_lua_comments(raw);
+    let Some(table_body) = extract_lua_table_body(&without_comments) else {
+        return LuaMonitorParse::Dynamic {
+            connector: None,
+            line_number,
+        };
+    };
+
+    let mut output: Option<String> = None;
+    let mut mode: Option<String> = None;
+    let mut position: Option<String> = None;
+    let mut scale: Option<String> = None;
+    let mut disabled: Option<bool> = None;
+    let mut has_dynamic_output = false;
+    let mut has_dynamic_field = false;
+
+    for entry in split_lua_table_entries(table_body) {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = split_lua_table_entry(trimmed) else {
+            has_dynamic_field = true;
+            has_dynamic_output = true;
+            continue;
+        };
+        match key.as_str() {
+            "output" => {
+                if let Some(parsed) = parse_lua_string_literal(value) {
+                    output = Some(parsed);
+                    has_dynamic_output = false;
+                } else {
+                    has_dynamic_output = true;
+                    has_dynamic_field = true;
+                }
+            }
+            "mode" => {
+                if let Some(parsed) = parse_lua_string_literal(value) {
+                    mode = Some(parsed);
+                } else {
+                    has_dynamic_field = true;
+                }
+            }
+            "position" => {
+                if let Some(parsed) = parse_lua_string_literal(value) {
+                    position = Some(parsed);
+                } else {
+                    has_dynamic_field = true;
+                }
+            }
+            "scale" => {
+                if let Some(parsed) = parse_lua_scale_literal(value) {
+                    scale = Some(parsed);
+                } else {
+                    has_dynamic_field = true;
+                }
+            }
+            "disabled" => match value {
+                "true" => disabled = Some(true),
+                "false" => disabled = Some(false),
+                _ => has_dynamic_field = true,
+            },
+            _ => {}
+        }
+    }
+
+    if has_dynamic_field {
+        return LuaMonitorParse::Dynamic {
+            connector: (!has_dynamic_output).then_some(output).flatten(),
+            line_number,
+        };
+    }
+
+    let resolved_mode = if disabled == Some(true) {
+        Some("disabled".to_string())
+    } else {
+        mode
+    };
+    let (Some(connector), Some(resolved_mode)) = (output.clone(), resolved_mode) else {
+        return LuaMonitorParse::Dynamic {
+            connector: output,
+            line_number,
+        };
+    };
+
+    LuaMonitorParse::Literal(MonitorRule {
         path: path.to_path_buf(),
-        line_number: contents[..start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            + 1,
+        line_number,
         raw: raw.to_string(),
-        connector: connector.1.clone(),
-        mode,
-        position: fields
-            .iter()
-            .find(|(key, _)| key == "position")
-            .map(|(_, value)| value.clone()),
-        scale: fields
-            .iter()
-            .find(|(key, _)| key == "scale")
-            .map(|(_, value)| value.clone()),
+        connector,
+        mode: resolved_mode,
+        position,
+        scale,
     })
 }
 
-fn find_balanced_lua_call(contents: &str, open: usize) -> Option<usize> {
+fn extract_lua_table_body(without_comments: &str) -> Option<&str> {
+    let mut rest = without_comments.trim();
+    if let Some(after_name) = rest.strip_prefix("hl.monitor") {
+        rest = after_name.trim();
+    }
+    if rest.starts_with('(') {
+        let close = find_balanced_lua_delim(rest, 0, b'(', b')')?;
+        if close + 1 != rest.len() {
+            return None;
+        }
+        rest = rest[1..close].trim();
+    }
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let close = find_balanced_lua_delim(rest, 0, b'{', b'}')?;
+    if close + 1 != rest.len() {
+        return None;
+    }
+    Some(&rest[1..close])
+}
+
+fn find_balanced_lua_delim(
+    contents: &str,
+    open: usize,
+    open_byte: u8,
+    close_byte: u8,
+) -> Option<usize> {
     let bytes = contents.as_bytes();
     let mut depth = 0usize;
     let mut index = open;
     while index < bytes.len() {
-        if bytes[index..].starts_with(b"--[[") {
-            index = find_bytes(bytes, index + 4, b"]]")? + 2;
+        if let Some(end) = skip_lua_comment_body(bytes, index) {
+            index = end;
             continue;
         }
-        if bytes[index..].starts_with(b"--") {
-            index = bytes[index..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|relative| index + relative + 1)
-                .unwrap_or(bytes.len());
-            continue;
-        }
-        if bytes[index..].starts_with(b"[[") {
-            index = find_bytes(bytes, index + 2, b"]]")? + 2;
+        if let Some((content_start, eq_count)) = lua_long_bracket_open(bytes, index) {
+            index = find_lua_long_bracket_close(bytes, content_start, eq_count)? + eq_count + 2;
             continue;
         }
         if matches!(bytes[index], b'\'' | b'"') {
-            index = skip_quoted_lua_string(bytes, index);
+            index = find_quoted_lua_string_end(bytes, index)? + 1;
             continue;
         }
-        if bytes[index] == b'(' {
+        if bytes[index] == open_byte {
             depth += 1;
-        } else if bytes[index] == b')' {
+        } else if bytes[index] == close_byte {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return Some(index);
@@ -474,105 +784,118 @@ fn find_balanced_lua_call(contents: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn parse_lua_table_fields(raw: &str) -> Vec<(String, String)> {
-    let without_comments = strip_lua_comments(raw);
-    let table = without_comments
-        .find('{')
-        .and_then(|start| {
-            without_comments
-                .rfind('}')
-                .filter(|end| *end > start)
-                .map(|end| &without_comments[start + 1..end])
-        })
-        .unwrap_or(&without_comments);
-
-    table
-        .split([',', ';', '\n'])
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=')?;
-            let key = key.trim().to_string();
-            let value = value
-                .trim()
-                .trim_matches(|character| matches!(character, '"' | '\'' | '}' | ')'))
-                .trim()
-                .to_string();
-            matches!(
-                key.as_str(),
-                "output" | "mode" | "position" | "scale" | "disabled"
-            )
-            .then_some((key, value))
-        })
-        .collect()
-}
-
-fn strip_lua_comments(contents: &str) -> String {
-    let bytes = contents.as_bytes();
-    let mut cleaned = String::with_capacity(contents.len());
-    let mut index = 0;
+fn split_lua_table_entries(table_body: &str) -> Vec<&str> {
+    let bytes = table_body.as_bytes();
+    let mut entries = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
 
     while index < bytes.len() {
-        if bytes[index..].starts_with(b"--[[") {
-            let end = find_bytes(bytes, index + 4, b"]]")
-                .map(|end| end + 2)
+        if let Some((content_start, eq_count)) = lua_long_bracket_open(bytes, index) {
+            index = find_lua_long_bracket_close(bytes, content_start, eq_count)
+                .map(|close| close + eq_count + 2)
                 .unwrap_or(bytes.len());
-            cleaned.extend(
-                contents[index..end]
-                    .chars()
-                    .filter(|character| *character == '\n'),
-            );
-            index = end;
-            continue;
-        }
-        if bytes[index..].starts_with(b"--") {
-            let end = bytes[index..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|relative| index + relative)
-                .unwrap_or(bytes.len());
-            index = end;
             continue;
         }
         if matches!(bytes[index], b'\'' | b'"') {
-            let end = skip_quoted_lua_string(bytes, index);
-            cleaned.push_str(&contents[index..end]);
-            index = end;
+            index = skip_quoted_lua_string(bytes, index);
             continue;
         }
-        if bytes[index..].starts_with(b"[[") {
-            let end = find_bytes(bytes, index + 2, b"]]")
-                .map(|end| end + 2)
-                .unwrap_or(bytes.len());
-            cleaned.push_str(&contents[index..end]);
-            index = end;
-            continue;
+        match bytes[index] {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b',' | b';' if paren_depth == 0 && brace_depth == 0 && bracket_depth == 0 => {
+                entries.push(&table_body[start..index]);
+                start = index + 1;
+            }
+            _ => {}
         }
-
-        let Some(character) = contents[index..].chars().next() else {
-            break;
-        };
-        cleaned.push(character);
-        index += character.len_utf8();
+        index += 1;
     }
 
-    cleaned
+    if start <= table_body.len() {
+        entries.push(&table_body[start..]);
+    }
+    entries
 }
 
-fn parse_literal_lua_call_argument(raw: &str) -> Option<String> {
-    let cleaned = strip_lua_comments(raw);
-    let raw = cleaned.as_str();
-    let open = raw.find('(')?;
-    let value = raw.get(open + 1..raw.len().checked_sub(1)?)?.trim();
-    let quote = *value.as_bytes().first()?;
-    if !matches!(quote, b'\'' | b'"')
-        || value.as_bytes().last() != Some(&quote)
-        || skip_quoted_lua_string(value.as_bytes(), 0) != value.len()
+fn split_lua_table_entry(entry: &str) -> Option<(String, &str)> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+    if entry.starts_with('[') {
+        let close = find_balanced_lua_delim(entry, 0, b'[', b']')?;
+        let key = parse_lua_string_literal(entry[1..close].trim())?;
+        let rest = entry[close + 1..].trim_start();
+        let after_eq = rest.strip_prefix('=')?;
+        if after_eq.starts_with('=') {
+            return None;
+        }
+        return Some((key, after_eq.trim()));
+    }
+
+    let (raw_key, raw_value) = entry.split_once('=')?;
+    if raw_value.starts_with('=') {
+        return None;
+    }
+    let key = raw_key.trim();
+    let first = *key.as_bytes().first()?;
+    if !(first.is_ascii_alphabetic() || first == b'_') || !key.bytes().all(is_lua_identifier_byte) {
+        return None;
+    }
+    Some((key.to_string(), raw_value.trim()))
+}
+
+fn parse_lua_scale_literal(value: &str) -> Option<String> {
+    if let Some(text) = parse_lua_string_literal(value) {
+        return (!text.is_empty()).then_some(text);
+    }
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        || value.bytes().filter(|byte| *byte == b'.').count() > 1
     {
+        return None;
+    }
+    let numeric = value.parse::<f64>().ok()?;
+    (numeric.is_finite() && numeric > 0.0).then(|| value.to_string())
+}
+
+fn parse_lua_string_literal(value: &str) -> Option<String> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if let Some((content_start, eq_count)) = lua_long_bracket_open(bytes, 0) {
+        let close = find_lua_long_bracket_close(bytes, content_start, eq_count)?;
+        if close + eq_count + 2 != bytes.len() {
+            return None;
+        }
+        let mut content = &value[content_start..close];
+        if let Some(rest) = content.strip_prefix("\r\n") {
+            content = rest;
+        } else if let Some(rest) = content.strip_prefix('\n') {
+            content = rest;
+        }
+        return Some(content.to_string());
+    }
+
+    let end = find_quoted_lua_string_end(bytes, 0)?;
+    if end + 1 != bytes.len() {
         return None;
     }
 
     let mut result = String::new();
     let mut escaped = false;
-    for character in value[1..value.len() - 1].chars() {
+    for character in value[1..end].chars() {
         if escaped {
             result.push(match character {
                 'n' => '\n',
@@ -591,6 +914,64 @@ fn parse_literal_lua_call_argument(raw: &str) -> Option<String> {
         result.push('\\');
     }
     Some(result)
+}
+
+fn strip_lua_comments(contents: &str) -> String {
+    let bytes = contents.as_bytes();
+    let mut cleaned = String::with_capacity(contents.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if let Some(end) = skip_lua_comment_body(bytes, index) {
+            cleaned.extend(
+                contents[index..end]
+                    .chars()
+                    .filter(|character| *character == '\n'),
+            );
+            index = end;
+            continue;
+        }
+        if matches!(bytes[index], b'\'' | b'"') {
+            let end = skip_quoted_lua_string(bytes, index);
+            cleaned.push_str(&contents[index..end]);
+            index = end;
+            continue;
+        }
+        if let Some((content_start, eq_count)) = lua_long_bracket_open(bytes, index) {
+            let end = find_lua_long_bracket_close(bytes, content_start, eq_count)
+                .map(|close| close + eq_count + 2)
+                .unwrap_or(bytes.len());
+            cleaned.push_str(&contents[index..end]);
+            index = end;
+            continue;
+        }
+
+        let Some(character) = contents[index..].chars().next() else {
+            break;
+        };
+        cleaned.push(character);
+        index += character.len_utf8();
+    }
+
+    cleaned
+}
+
+fn parse_literal_lua_call_argument(raw: &str) -> Option<String> {
+    let cleaned = strip_lua_comments(raw);
+    let trimmed = cleaned.trim();
+    let name_len = trimmed
+        .bytes()
+        .take_while(|byte| is_lua_identifier_byte(*byte))
+        .count();
+    let mut arg = trimmed.get(name_len..)?.trim();
+    if arg.starts_with('(') {
+        let close = find_balanced_lua_delim(arg, 0, b'(', b')')?;
+        if close + 1 != arg.len() {
+            return None;
+        }
+        arg = arg[1..close].trim();
+    }
+    parse_lua_string_literal(arg)
 }
 
 fn resolve_lua_require(module: &str, including_file: &Path) -> Option<PathBuf> {
@@ -633,9 +1014,11 @@ fn normalize_monitor_rule(rule: &str) -> Option<String> {
         .into_iter()
         .find(|call| call.kind == LuaCallKind::Monitor)
         .and_then(|call| {
-            parse_lua_monitor_rule(Path::new("<expected>"), rule, call.start, call.end)
+            match parse_lua_monitor_call(Path::new("<expected>"), rule, call.start, call.end) {
+                LuaMonitorParse::Literal(parsed) => Some(parsed.normalized_rule()),
+                LuaMonitorParse::Dynamic { .. } => None,
+            }
         })
-        .map(|parsed| parsed.normalized_rule())
 }
 
 fn parse_assignment(line: &str) -> Option<(&str, &str)> {
@@ -1188,6 +1571,214 @@ mod tests {
             report.exact_match.as_ref().map(|rule| rule.line_number),
             Some(3)
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supports_parenthesis_free_lua_calls_and_quoted_commas() {
+        let dir = unique_test_dir();
+        let hypr = dir.join("hypr");
+        fs::create_dir_all(&hypr).unwrap();
+        let root = hypr.join("hyprland.lua");
+        let extra = hypr.join("extra.lua");
+        let shared = hypr.join("shared.lua");
+        fs::write(
+            &root,
+            "dofile 'extra.lua'\n\
+             require [[hypr.shared]]\n\
+             hl.monitor {\n\
+                 output = \"desc:Dell, Inc. U2723QE\",\n\
+                 mode = \"3840x2160@60\",\n\
+                 position = \"0x0\",\n\
+                 [\"scale\"] = \"auto\",\n\
+                 reserved = { mode = \"800x600@60\", top = 30 },\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            &extra,
+            "hl.monitor { output = \"DP-1\", mode = \"1920x1080@120\", position = \"auto\", scale = 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            &shared,
+            "hl.monitor { output = \"DP-1\", mode = \"1920x1080@144\", position = \"auto\", scale = 1.25 }\n",
+        )
+        .unwrap();
+
+        let dp1 =
+            inspect_monitor_rule_from(root.clone(), "DP-1", "monitor=DP-1,1920x1080@144,auto,1.25");
+        assert_eq!(dp1.files_read, 3);
+        assert!(dp1.read_warnings.is_empty());
+        assert_eq!(dp1.connector_rules.len(), 2);
+        assert!(dp1.exact_match_is_effective());
+
+        let dell = inspect_monitor_rule_from(
+            root,
+            "desc:Dell, Inc. U2723QE",
+            "monitor=desc:Dell, Inc. U2723QE,3840x2160@60,0x0,auto",
+        );
+        assert_eq!(dell.connector_rules.len(), 1);
+        assert_eq!(dell.connector_rules[0].connector, "desc:Dell, Inc. U2723QE");
+        assert_eq!(dell.connector_rules[0].mode, "3840x2160@60");
+        assert_eq!(dell.connector_rules[0].scale.as_deref(), Some("auto"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skips_dynamic_lua_identifiers_and_method_shadowed_calls() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("hyprland.lua");
+        fs::write(
+            &root,
+            "local custom = { require = function() end }\n\
+             custom.require('nonexistent')\n\
+             hl.monitor({ output = dynamic_connector, mode = '1920x1080@60' })\n\
+             hl.monitor({ output = 'DP-1', mode = dynamic_mode })\n\
+             hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = dyn_pos, scale = dyn_scale })\n",
+        )
+        .unwrap();
+
+        let dynamic = inspect_monitor_rule_from(
+            root.clone(),
+            "dynamic_connector",
+            "monitor=dynamic_connector,1920x1080@60",
+        );
+        assert!(dynamic.connector_rules.is_empty());
+        assert!(!dynamic.exact_match_is_effective());
+        assert_eq!(dynamic.read_warnings.len(), 3);
+
+        let dp1 = inspect_monitor_rule_from(root, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(dp1.connector_rules.is_empty());
+        assert!(!dp1.exact_match_is_effective());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_dynamic_lua_or_conf_override_makes_earlier_exact_match_uncertain() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        // Exact reproducer: later Lua rule using mode = preferred_mode.
+        let lua_mode = dir.join("mode_override.lua");
+        fs::write(
+            &lua_mode,
+            "hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             hl.monitor({ output = 'DP-1', mode = preferred_mode, position = '0x0', scale = 1 })\n",
+        )
+        .unwrap();
+        let report = inspect_monitor_rule_from(lua_mode, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(
+            report
+                .uncertain_override
+                .as_deref()
+                .is_some_and(|location| location.ends_with(":2"))
+        );
+
+        // Later dynamic output / non-table call / dynamic include also makes match uncertain.
+        let lua_unknown = dir.join("unknown_override.lua");
+        fs::write(
+            &lua_unknown,
+            "hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             hl.monitor(monitor_table)\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(lua_unknown, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(report.uncertain_override.is_some());
+
+        let lua_dofile = dir.join("dofile_override.lua");
+        fs::write(
+            &lua_dofile,
+            "hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             dofile(config_dir .. '/extra.lua')\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(lua_dofile, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(report.uncertain_override.is_some());
+
+        // Dynamic rule targeting a DIFFERENT connector does not invalidate DP-1,
+        // and an earlier dynamic rule overridden by a later exact match stays effective.
+        let lua_other = dir.join("other_connector.lua");
+        fs::write(
+            &lua_other,
+            "hl.monitor({ output = 'DP-1', mode = preferred_mode })\n\
+             hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             hl.monitor({ output = 'HDMI-A-1', mode = preferred_mode })\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(lua_other, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match_is_effective());
+        assert_eq!(report.uncertain_override, None);
+
+        // Dynamic .conf override after exact match also marks persistence uncertain.
+        let conf_dynamic = dir.join("dynamic.conf");
+        fs::write(
+            &conf_dynamic,
+            "monitor=DP-1,1920x1080@60,0x0,1\nmonitor=DP-1,$CUSTOM_MODE,0x0,1\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(conf_dynamic, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(
+            report
+                .uncertain_override
+                .as_deref()
+                .is_some_and(|location| location.ends_with(":2"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounds_diamond_includes_and_rejects_non_regular_files() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        // Build a 12-level diamond DAG (2^12 = 4096 paths without a file-read cap).
+        for level in 0..12 {
+            let file = dir.join(format!("l{level}.conf"));
+            let next = format!("l{}.conf", level + 1);
+            fs::write(&file, format!("source = {next}\nsource = {next}\n")).unwrap();
+        }
+        fs::write(dir.join("l12.conf"), "monitor=DP-1,1920x1080@60,auto,1\n").unwrap();
+
+        let report = inspect_monitor_rule_from(
+            dir.join("l0.conf"),
+            "DP-1",
+            "monitor=DP-1,1920x1080@60,auto,1",
+        );
+        assert_eq!(report.files_read, MAX_CONFIG_FILES_READ);
+        assert_eq!(report.read_warnings.len(), 1);
+        assert!(report.read_warnings[0].contains("Stopped reading"));
+
+        let fifo = dir.join("pipe.conf");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(mkfifo.success());
+        let fifo_report = inspect_monitor_rule_from(fifo, "DP-1", "monitor=DP-1,1920x1080@60");
+        assert_eq!(fifo_report.files_read, 0);
+        assert!(
+            fifo_report
+                .read_warnings
+                .iter()
+                .any(|warning| warning.contains("not a regular file"))
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

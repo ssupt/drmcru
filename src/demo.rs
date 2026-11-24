@@ -97,7 +97,7 @@ fn sample_edid() -> Result<Vec<u8>> {
     cta[1] = 3;
     cta[2] = 9;
     cta[4] = (2 << 5) | 4;
-    cta[5..9].copy_from_slice(&[0x80 | 16, 4, 64, 97]);
+    cta[5..9].copy_from_slice(&[0x80 | 16, 4, 63, 97]);
     cta[9..9 + DTD_LEN].copy_from_slice(&encode_detailed_timing(&timing_1080p(60.0))?);
     cta[9 + DTD_LEN..9 + 2 * DTD_LEN]
         .copy_from_slice(&encode_detailed_timing(&timing_1080p(120.0))?);

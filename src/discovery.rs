@@ -2,7 +2,6 @@ use crate::edid::{EdidError, parse_edid};
 use crate::models::{ConnectorStatus, HyprlandMonitor, Monitor};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -230,19 +229,6 @@ impl From<HyprlandMonitorJson> for HyprlandMonitor {
 
 fn empty_to_none(value: Option<String>) -> Option<String> {
     value.and_then(|value| (!value.is_empty()).then_some(value))
-}
-
-#[allow(dead_code)]
-fn is_connector_dir(path: &Path) -> bool {
-    path.file_name()
-        .and_then(OsStr::to_str)
-        .and_then(|name| name.split_once('-'))
-        .is_some()
-}
-
-#[allow(dead_code)]
-fn connector_sysfs_path(root: &Path, card: &str, connector: &str) -> PathBuf {
-    root.join(format!("{card}-{connector}"))
 }
 
 #[cfg(test)]

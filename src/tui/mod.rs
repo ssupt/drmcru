@@ -15,14 +15,13 @@ mod state;
 mod support;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::prelude::*;
 use state::{
     ApplyConfirmDialog, ApplyResultDialog, DetailedResolutionEditor, DetailsDialog,
     ExportConfirmDialog, ExportDialog, ImportDialog, StandardResolutionEditor, SystemOperation,
 };
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 use support::{TerminalSession, wrap_index};
@@ -107,8 +106,6 @@ enum PendingSystemAction {
     Install {
         monitor: Box<Monitor>,
         workspace: Box<EdidWorkspace>,
-        hyprland_mode: String,
-        output_dir: PathBuf,
         operation: SystemOperation,
     },
     Uninstall(UninstallPlan),
@@ -243,7 +240,9 @@ impl App {
             terminal.draw(|frame| self.draw(frame))?;
             if event::poll(Duration::from_millis(200))? {
                 match event::read()? {
-                    Event::Key(key) => {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         if self.applying_in_progress {
                             // Swallow all keys while install is running
                         } else if self.vrr_editor.is_some() {
@@ -455,15 +454,6 @@ impl App {
             .remove(&key)
             .unwrap_or_else(|| vec!["Selected row".to_string()]);
         ModeProvenance { key, sources }
-    }
-
-    fn provenance_suffix(&self, key: ModeKey) -> String {
-        let sources = self.mode_provenance_map().remove(&key).unwrap_or_default();
-        if sources.len() > 1 {
-            format!("  [{} sources]", sources.len())
-        } else {
-            String::new()
-        }
     }
 
     fn next_focus(&mut self) {
@@ -835,20 +825,33 @@ mod tests {
     #[test]
     fn cta_delete_keeps_selection_after_video_rows() {
         let mut app = App::new(vec![monitor_with_cta_dtd()]);
-        let location = DtdLocation::Cta {
-            extension_index: 1,
-            slot: 5,
-        };
         app.selected_workspace_mut()
             .unwrap()
-            .add_cta_dtd_at(location, timing())
+            .add_cta_dtd(1, timing())
             .unwrap();
-        app.selected_extension = Some(6);
+        app.selected_extension = Some(2);
         app.delete_selected_extension_dtd();
-        assert_eq!(app.selected_extension, Some(6));
+        assert_eq!(app.selected_extension, Some(2));
         assert!(
-            matches!(&app.working_extension_rows()[6], ExtensionRow::Dtd(row) if row.slot == 5 && row.timing.is_none())
+            matches!(&app.working_extension_rows()[2], ExtensionRow::Dtd(row) if row.slot == 1 && row.timing.is_none())
         );
+        assert!(app.selected_workspace().unwrap().validate().is_empty());
+    }
+
+    #[test]
+    fn adding_on_later_free_cta_slot_inserts_contiguously_and_stays_valid() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        // Select a non-first free CTA slot (slot 4, after video row 0 and occupied slot 0).
+        app.selected_extension = Some(5);
+        app.open_extension_add_editor();
+        app.apply_detailed_editor();
+
+        let workspace = app.selected_workspace().unwrap();
+        assert!(workspace.validate().is_empty());
+        let slots = workspace.cta_dtd_slots().unwrap();
+        assert!(slots[0].timing.is_some());
+        assert!(slots[1].timing.is_some());
+        assert!(slots[4].timing.is_none());
     }
 
     #[test]
@@ -1059,7 +1062,7 @@ mod tests {
 
     #[test]
     fn import_paths_expand_home_and_terminal_quotes() {
-        let home = PathBuf::from("/home/example");
+        let home = std::path::PathBuf::from("/home/example");
 
         assert_eq!(
             actions::normalize_import_path("~/Downloads/display.bin", Some(&home)),
@@ -1067,7 +1070,7 @@ mod tests {
         );
         assert_eq!(
             actions::normalize_import_path("'/tmp/display file.bin'", Some(&home)),
-            PathBuf::from("/tmp/display file.bin")
+            std::path::PathBuf::from("/tmp/display file.bin")
         );
     }
 
@@ -1094,16 +1097,221 @@ mod tests {
 
     #[test]
     fn import_reads_only_bounded_regular_files() {
-        let dir = std::env::temp_dir().join(format!("drmcru-import-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let edid = dir.join("edid.bin");
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("drmcru-import-{}-{nonce}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let edid = dir.0.join("edid.bin");
         std::fs::write(&edid, [0u8; 256]).unwrap();
         assert_eq!(actions::read_import_file(&edid).unwrap().len(), 256);
-        let large = dir.join("large.bin");
+        let large = dir.0.join("large.bin");
         std::fs::write(&large, vec![0u8; 256 * 128 + 1]).unwrap();
         assert!(actions::read_import_file(&large).is_err());
-        assert!(actions::read_import_file(&dir).is_err());
+        assert!(actions::read_import_file(&dir.0).is_err());
         assert!(actions::read_import_file(std::path::Path::new("/dev/zero")).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let fifo = dir.0.join("pipe.bin");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(mkfifo.success());
+        assert!(actions::read_import_file(&fifo).is_err());
+    }
+
+    #[test]
+    fn ctrl_c_and_command_modifiers_behave_safely() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        app.focus = FocusArea::Detailed;
+        app.selected_detailed = Some(0);
+        let initial_dtd_count = app.working_dtds().len();
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.handle_main_key(ctrl_c));
+        assert!(app.detailed_clipboard.is_none());
+
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(app.handle_main_key(ctrl_q));
+
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(!app.handle_main_key(ctrl_d));
+        assert_eq!(app.working_dtds().len(), initial_dtd_count);
+
+        let alt_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        assert!(!app.handle_main_key(alt_d));
+        assert_eq!(app.working_dtds().len(), initial_dtd_count);
+
+        app.open_detailed_editor(state::EditorMode::Add);
+        let before_width = app
+            .detailed_editor
+            .as_ref()
+            .unwrap()
+            .input(state::EditorField::Width)
+            .buffer
+            .clone();
+        app.handle_detailed_editor_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.detailed_editor
+                .as_ref()
+                .unwrap()
+                .input(state::EditorField::Width)
+                .buffer,
+            before_width
+        );
+        app.handle_detailed_editor_key(ctrl_c);
+        assert!(app.detailed_editor.is_none());
+
+        app.open_import_dialog();
+        let before_path = app.import_dialog.as_ref().unwrap().path.buffer.clone();
+        app.handle_import_dialog_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(app.import_dialog.as_ref().unwrap().path.buffer, before_path);
+        app.handle_import_dialog_key(ctrl_c);
+        assert!(app.import_dialog.is_none());
+    }
+
+    #[test]
+    fn adding_base_dtd_selects_inserted_location_not_trailing_cta_row() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        let dtds_before = app.working_dtds();
+        assert_eq!(dtds_before.len(), 1);
+        assert!(matches!(dtds_before[0].location, DtdLocation::Cta { .. }));
+
+        app.open_detailed_editor(state::EditorMode::Add);
+        app.apply_detailed_editor();
+
+        let dtds_after = app.working_dtds();
+        assert_eq!(dtds_after.len(), 2);
+        let selected = app
+            .selected_detailed
+            .expect("inserted DTD should be selected");
+        assert_eq!(selected, 0);
+        assert_eq!(dtds_after[selected].location, DtdLocation::Base { slot: 0 });
+    }
+
+    #[test]
+    fn apply_detailed_editor_surfaces_specific_validation_error() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        app.open_detailed_editor(state::EditorMode::Add);
+        let editor = app.detailed_editor.as_mut().unwrap();
+        editor.active_field = state::EditorField::HBlanking;
+        for _ in 0..4 {
+            editor.backspace();
+        }
+        editor.insert_char('1');
+        app.apply_detailed_editor();
+
+        assert!(app.detailed_editor.is_some());
+        assert!(
+            app.status.contains("horizontal blanking must be at least"),
+            "expected specific blanking error, got: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn reset_and_import_clear_all_selections_and_scroll_offsets() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        app.selected_workspace_mut()
+            .unwrap()
+            .add_dtd(timing())
+            .unwrap();
+        app.selected_detailed = Some(1);
+        app.selected_standard = Some(0);
+        app.selected_established = Some(0);
+        app.selected_extension = Some(0);
+        app.detailed_scroll = 3;
+        app.standard_scroll = 2;
+        app.established_scroll = 4;
+        app.extension_scroll = 5;
+
+        app.reset_workspace();
+        assert_eq!(app.selected_detailed, None);
+        assert_eq!(app.selected_standard, None);
+        assert_eq!(app.selected_established, None);
+        assert_eq!(app.selected_extension, None);
+        assert_eq!(app.detailed_scroll, 0);
+        assert_eq!(app.standard_scroll, 0);
+        assert_eq!(app.established_scroll, 0);
+        assert_eq!(app.extension_scroll, 0);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "drmcru-import-reset-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        let raw = app.selected_edid().unwrap().raw.clone();
+        std::fs::write(&path, &raw).unwrap();
+
+        app.selected_detailed = Some(0);
+        app.selected_standard = Some(0);
+        app.selected_established = Some(0);
+        app.selected_extension = Some(0);
+        app.detailed_scroll = 2;
+        app.standard_scroll = 2;
+        app.established_scroll = 2;
+        app.extension_scroll = 2;
+        app.open_import_dialog();
+        app.import_dialog
+            .as_mut()
+            .unwrap()
+            .path
+            .set(path.display().to_string());
+        app.apply_import_dialog();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(app.import_dialog.is_none());
+        assert_eq!(app.selected_detailed, None);
+        assert_eq!(app.selected_standard, None);
+        assert_eq!(app.selected_established, None);
+        assert_eq!(app.selected_extension, None);
+        assert_eq!(app.detailed_scroll, 0);
+        assert_eq!(app.standard_scroll, 0);
+        assert_eq!(app.established_scroll, 0);
+        assert_eq!(app.extension_scroll, 0);
+    }
+
+    #[test]
+    fn apply_result_dialog_clamps_downward_scroll() {
+        let mut dialog = state::ApplyResultDialog {
+            operation: SystemOperation::Install,
+            success: true,
+            output: "line 1\nline 2\nline 3".to_string(),
+            scroll: 0,
+        };
+        dialog.scroll_by(10_000);
+        assert_eq!(dialog.scroll, 8);
+        dialog.scroll_by(-10_000);
+        assert_eq!(dialog.scroll, 0);
+    }
+
+    #[test]
+    fn compact_24_row_terminal_renders_cleanly() {
+        let mut app = App::new(vec![monitor_with_cta_dtd()]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let contents = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(contents.contains("Detailed resolutions"));
+        assert!(contents.contains("Extension blocks"));
     }
 }

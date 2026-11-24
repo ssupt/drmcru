@@ -57,11 +57,20 @@ pub fn validate_timing(timing: &TimingDescriptor) -> Vec<TimingWarning> {
             "pixel clock {} kHz exceeds EDID DTD encoding limit 655350 kHz",
             timing.pixel_clock_khz
         )));
-    } else if timing.pixel_clock_khz > 600_000 {
-        warnings.push(TimingWarning::warning(format!(
-            "pixel clock is high: {} kHz",
-            timing.pixel_clock_khz
-        )));
+    } else {
+        if timing.pixel_clock_khz >= 10 && !timing.pixel_clock_khz.is_multiple_of(10) {
+            let encoded = (timing.pixel_clock_khz.saturating_add(5) / 10) * 10;
+            warnings.push(TimingWarning::warning(format!(
+                "pixel clock {} kHz is not a 10 kHz multiple; EDID DTD encodes {} kHz",
+                timing.pixel_clock_khz, encoded
+            )));
+        }
+        if timing.pixel_clock_khz > 600_000 {
+            warnings.push(TimingWarning::warning(format!(
+                "pixel clock is high: {} kHz",
+                timing.pixel_clock_khz
+            )));
+        }
     }
 
     validate_12_bit(&mut warnings, "horizontal active", timing.h_active);
@@ -283,5 +292,17 @@ mod tests {
                 .iter()
                 .any(|warning| warning.message.contains("exceeds EDID DTD encoding limit"))
         );
+    }
+
+    #[test]
+    fn warns_when_pixel_clock_is_not_a_10_khz_multiple() {
+        let mut timing = valid_timing();
+        timing.pixel_clock_khz = 138_506;
+        let warnings = validate_timing(&timing);
+        assert!(warnings.iter().any(|warning| {
+            warning.severity == TimingWarningSeverity::Warning
+                && warning.message.contains("10 kHz multiple")
+                && warning.message.contains("138510 kHz")
+        }));
     }
 }

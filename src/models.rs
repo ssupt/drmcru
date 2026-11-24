@@ -298,12 +298,12 @@ impl TimingDescriptor {
         Ok(values.map(|value| value / 2))
     }
 
-    pub fn h_total(&self) -> u16 {
-        self.h_active.saturating_add(self.h_blanking)
+    pub fn h_total(&self) -> u32 {
+        u32::from(self.h_active) + u32::from(self.h_blanking)
     }
 
-    pub fn v_total(&self) -> u16 {
-        self.v_active.saturating_add(self.v_blanking)
+    pub fn v_total(&self) -> u32 {
+        u32::from(self.v_active) + u32::from(self.v_blanking)
     }
 
     pub fn horizontal_rate_khz(&self) -> Option<f64> {
@@ -316,14 +316,17 @@ impl TimingDescriptor {
     }
 
     pub fn refresh_hz(&self) -> Option<f64> {
-        let h_total = u32::from(self.h_total());
-        let v_total = u32::from(self.v_total());
+        let h_total = self.h_total();
+        let v_total = self.v_total();
         if h_total == 0 || v_total == 0 {
             return None;
         }
 
         let scan = if self.interlaced { 2.0 } else { 1.0 };
-        Some((f64::from(self.pixel_clock_khz) * 1000.0 * scan) / f64::from(h_total * v_total))
+        Some(
+            (f64::from(self.pixel_clock_khz) * 1000.0 * scan)
+                / (f64::from(h_total) * f64::from(v_total)),
+        )
     }
 
     pub fn hyprland_mode(&self) -> String {

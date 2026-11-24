@@ -34,7 +34,7 @@ restore_boot() {
             rm -f -- "$path" || failed=1
         fi
     done < <(find "$BOOT_ROOT" -mindepth 1 -depth -print0)
-    cp -a -- "$TX/boot/." "$BOOT_ROOT/" || failed=1
+    cp -R --no-dereference --preserve=timestamps -- "$TX/boot/." "$BOOT_ROOT/" || failed=1
     diff -qr --no-dereference -- "$TX/boot" "$BOOT_ROOT" >/dev/null || failed=1
     return "$failed"
 }
@@ -52,6 +52,7 @@ finish() {
         restore_boot || failed=1
         for ((i=${#NEW_DIRS[@]} - 1; i >= 0; i--)); do rmdir -- "${NEW_DIRS[$i]}" 2>/dev/null || true; done
         if [ "$failed" -eq 0 ]; then
+            for i in "${BACKUP_PATHS[@]}"; do rm -f -- "$i" || true; done
             echo "[OK] Restored configuration, firmware and boot artifacts after failure" >&2
         else
             echo "[ERR] Recovery was incomplete. Do not reboot. Recovery files: $TX" >&2
@@ -198,7 +199,7 @@ refresh_hashes() {
 # Validate the supported stack before touching configuration or firmware.
 [ "$(id -u)" -eq 0 ] || die "This installer must run as root"
 [[ "$CONNECTOR" =~ ^[A-Za-z0-9._-]+$ && "$EDID_NAME" =~ ^[A-Za-z0-9._-]+$ && "$EDID_NAME" != . && "$EDID_NAME" != .. ]] || die "Unsafe connector or EDID file name"
-for tool in mkinitcpio lsinitcpio objcopy limine-entry-tool limine-mkinitcpio pacman flock b2sum realpath diff findmnt; do
+for tool in mkinitcpio lsinitcpio objcopy limine-entry-tool limine-mkinitcpio pacman flock b2sum sha256sum realpath diff findmnt; do
     command -v "$tool" >/dev/null || die "$tool is required for verified automatic installation; use Export on this system"
 done
 for tool in "$MKINITCPIO_BIN" "$LSINITCPIO_BIN" "$ENTRY_TOOL_BIN" "$OBJCOPY_BIN"; do
@@ -208,7 +209,7 @@ done
 [ -f "$MKINIT" ] && [ ! -L "$MKINIT" ] || die "/etc/mkinitcpio.conf not found or not a regular file"
 [ -f "$LIMINE" ] && [ ! -L "$LIMINE" ] || die "/boot/limine.conf not found or not a regular file"
 grep -qE '^[[:space:]]*cmdline:' "$LIMINE" || die "/boot/limine.conf has no cmdline entries"
-[ "$OPERATION" != add ] || [ -s "$EDID_SOURCE" ] || die "EDID source does not exist: $EDID_SOURCE"
+[ "$OPERATION" != add ] || { [ -f "$EDID_SOURCE" ] && [ ! -L "$EDID_SOURCE" ] && [ -s "$EDID_SOURCE" ]; } || die "EDID source must be a non-empty regular file: $EDID_SOURCE"
 [ -f "$LIMINE_FUNCTIONS" ] || die "Limine entry-tool integration is unavailable"
 for directory in "$MKINIT_DROPIN_DIR" "$LIMINE_DROPIN_DIR" "${LIMINE_DEFAULT_CONFIG%/*}" "${FIRMWARE_TARGET%/*}"; do
     [ ! -L "$directory" ] || die "Managed directory is a symlink: $directory"
@@ -224,8 +225,14 @@ check_boot_partition "$BOOT_ROOT"
 [ -s "$MACHINE_ID_FILE" ] || die "Machine ID is missing"
 MACHINE_ID="$(cat "$MACHINE_ID_FILE")"
 [[ "$MACHINE_ID" =~ ^[a-fA-F0-9]{32}$ ]] || die "Invalid machine ID"
-UKI_PREFIX="${CUSTOM_UKI_NAME:-$MACHINE_ID}"
-[[ "$UKI_PREFIX" =~ ^[a-z0-9]+$ ]] || die "Invalid custom UKI prefix"
+UKI_PREFIX="$MACHINE_ID"
+if [ -n "${CUSTOM_UKI_NAME:-}" ]; then
+    if [[ "$CUSTOM_UKI_NAME" =~ ^[a-z0-9]+$ ]]; then
+        UKI_PREFIX="$CUSTOM_UKI_NAME"
+    else
+        echo "[WARN] Ignoring invalid CUSTOM_UKI_NAME; Limine falls back to machine ID" >&2
+    fi
+fi
 IMAGE_KIND=initramfs; EMBED_CMDLINE=1
 if [ "${ENABLE_UKI:-no}" = yes ] && is_uefi; then
     IMAGE_KIND=uki
@@ -250,8 +257,18 @@ exec 201>"$BOOT_LOCK"; flock --timeout=30 201 || die "Another boot operation is 
 (set -o noclobber; printf 'drmcru-%s' "$$" > "$PACKAGE_LOCK") 2>/dev/null || die "A package transaction is running"
 PACKAGE_LOCK_OWNED=1
 TX="$(mktemp -d "$TRANSACTION_ROOT/drmcru-boot.XXXXXXXX")"; chmod 700 "$TX"
+if [ "$OPERATION" = add ]; then
+    [ -f "$EDID_SOURCE" ] && [ ! -L "$EDID_SOURCE" ] && [ -s "$EDID_SOURCE" ] || die "EDID source must be a non-empty regular file: $EDID_SOURCE"
+    head -c 32769 -- "$EDID_SOURCE" > "$TX/edid.bin"
+    edid_size="$(stat -c %s "$TX/edid.bin")"
+    [ "$edid_size" -gt 0 ] && [ "$edid_size" -le 32768 ] || die "EDID source exceeds maximum 32 KiB EDID size"
+    if [ -n "${EDID_SHA256:-}" ]; then
+        edid_actual_hash="$(sha256sum "$TX/edid.bin" | cut -d ' ' -f1)"
+        [ "$edid_actual_hash" = "$EDID_SHA256" ] || die "EDID source changed during authorization"
+    fi
+fi
 mkdir -- "$TX/boot"
-cp -a -- "$BOOT_ROOT/." "$TX/boot/"
+cp -R --no-dereference --preserve=timestamps -- "$BOOT_ROOT/." "$TX/boot/"
 diff -qr --no-dereference -- "$TX/boot" "$BOOT_ROOT" >/dev/null
 SNAPSHOT_READY=1
 
@@ -291,10 +308,10 @@ if [ -e "$BOOT_ROOT/drmcru-recovery" ]; then
     [ -f "$BOOT_ROOT/drmcru-recovery/.drmcru-owned" ] || die "Recovery path is not owned by drmcru"
 fi
 
-for path in "$MKINIT" "$MKINIT_DROPIN" "$LIMINE_DROPIN" "$LIMINE_DEFAULT_CONFIG" "$FIRMWARE_TARGET"; do backup_file "$path"; done
-for config in "$LIMINE_VENDOR_DIR/"*.conf "$LIMINE_CONFIG" "$LIMINE_DROPIN_DIR/"*.conf "$LIMINE_DEFAULT_CONFIG"; do
-    [ ! -f "$config" ] || backup_file "$config"
+for path in "$MKINIT" "$MKINIT_DROPIN" "$LIMINE_DROPIN" "$LIMINE_DEFAULT_CONFIG" "$FIRMWARE_TARGET"; do
+    [ ! -L "$path" ] || die "Configuration or firmware is a symlink: $path"
 done
+for path in "$LIMINE_DROPIN" "$LIMINE_DEFAULT_CONFIG"; do backup_file "$path"; done
 for directory in "$MKINIT_DROPIN_DIR" "$LIMINE_DROPIN_DIR" "${FIRMWARE_TARGET%/*}" "${LIMINE_DEFAULT_CONFIG%/*}"; do
     if [ ! -d "$directory" ]; then NEW_DIRS+=("$directory"); fi
 done
@@ -352,7 +369,7 @@ for key in "${KEYS[@]}"; do
         $0 in wanted { result=result (result=="" ? "" : ",") $0 }
         END { print result }
     ')"
-    expected="$(printf '%s\n%s\n' "$base" "$inherited" | awk -v operation="$OPERATION" -v connector="$CONNECTOR" -v firmware="edid/$EDID_NAME" -v suppressed="$removals" -v replace_others=1 -v retained_others="$retained" "$CMDLINE_AWK")"
+    expected="$(printf '%s\n%s\n' "$base" "$inherited" | RETAINED_OTHERS="$retained" awk -v operation="$OPERATION" -v connector="$CONNECTOR" -v firmware="edid/$EDID_NAME" -v suppressed="$removals" -v replace_others=1 "$CMDLINE_AWK")"
     EXPECTED_CMDLINES[$key]="$expected"
     contribution="$(printf '\n%s\n' "$inherited" | awk -v operation="$OPERATION" -v connector="$CONNECTOR" -v firmware="edid/$EDID_NAME" -v suppressed="$removals" "$CMDLINE_AWK")"
     [ -z "$contribution" ] || printf '# drmcru-map[%s]= %s\n' "$key" "$contribution" >> "$TX/new-owned.conf"
@@ -380,8 +397,13 @@ for key in "${KEYS[@]}"; do
     current="$(cmdline "$key")"
     [ "$(canonical "$current")" = "${EXPECTED_CMDLINES[$key]}" ] || die "A higher-priority Limine setting overrides $key; use Export"
 done
-if [ "$OPERATION" = add ]; then install -D -m 0644 -- "$EDID_SOURCE" "$FIRMWARE_TARGET";
-elif [ "$KEEP_FIRMWARE" -eq 0 ]; then rm -f -- "$FIRMWARE_TARGET"; fi
+if [ "$OPERATION" = add ]; then
+    backup_file "$FIRMWARE_TARGET"
+    install -D -m 0644 -- "$TX/edid.bin" "$FIRMWARE_TARGET"
+elif [ "$KEEP_FIRMWARE" -eq 0 ]; then
+    backup_file "$FIRMWARE_TARGET"
+    rm -f -- "$FIRMWARE_TARGET"
+fi
 if [ "$OPERATION" = remove ] && [ "$KEEP_FIRMWARE" -eq 0 ]; then update_mkinitcpio_dropin remove; fi
 remove_legacy_mkinitcpio_entry
 # Every referenced firmware file must be available in each early initramfs.
@@ -469,7 +491,7 @@ while IFS= read -r line; do
         relative="${uri#boot():/}"; source="$TX/boot/$relative"
         [ -f "$source" ] || die "Recovery resource is missing: $relative"
         resource="drmcru-recovery/$resource_index-${source##*/}"
-        cp -a -- "$source" "$BOOT_ROOT/$resource"
+        cp --no-dereference --preserve=timestamps -- "$source" "$BOOT_ROOT/$resource"
         hash="$(b2sum "$BOOT_ROOT/$resource")"; RESOURCE_HASHES[$resource]="${hash%% *}"
         printf '%sboot():/%s#%s\n' "$prefix" "$resource" "${hash%% *}" >> "$TX/recovery-menu"
         resource_index=$((resource_index+1))

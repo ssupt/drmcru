@@ -500,10 +500,7 @@ impl App {
             return;
         };
 
-        self.open_detailed_editor(EditorMode::AddCta {
-            extension_index,
-            slot: Some(slot),
-        });
+        self.open_detailed_editor(EditorMode::AddCta { extension_index });
         self.status =
             format!("Adding detailed timing to CTA-861 extension {extension_index} slot {slot}.");
     }
@@ -762,7 +759,13 @@ impl App {
         match workspace.reset() {
             Ok(()) => {
                 self.selected_detailed = None;
+                self.selected_standard = None;
+                self.selected_established = None;
                 self.selected_extension = None;
+                self.established_scroll = 0;
+                self.detailed_scroll = 0;
+                self.standard_scroll = 0;
+                self.extension_scroll = 0;
                 self.status = "Reset working EDID to the original monitor EDID.".to_string();
             }
             Err(error) => {
@@ -776,10 +779,12 @@ impl App {
             return;
         };
         let mode = editor.mode;
-        let Ok(timing) = editor.timing() else {
-            self.status =
-                "Cannot apply: width, height, and refresh must be valid numbers.".to_string();
-            return;
+        let timing = match editor.timing() {
+            Ok(timing) => timing,
+            Err(reason) => {
+                self.status = format!("Cannot apply detailed timing: {reason}.");
+                return;
+            }
         };
 
         let result = match mode {
@@ -791,26 +796,13 @@ impl App {
                 };
                 workspace.add_dtd(timing.clone())
             }
-            EditorMode::AddCta {
-                extension_index,
-                slot,
-            } => {
+            EditorMode::AddCta { extension_index } => {
                 let Some(workspace) = self.selected_workspace_mut() else {
                     self.status =
                         "Cannot apply: selected monitor has no readable EDID.".to_string();
                     return;
                 };
-                if let Some(slot) = slot {
-                    workspace.add_cta_dtd_at(
-                        DtdLocation::Cta {
-                            extension_index,
-                            slot,
-                        },
-                        timing.clone(),
-                    )
-                } else {
-                    workspace.add_cta_dtd(extension_index, timing.clone())
-                }
+                workspace.add_cta_dtd(extension_index, timing.clone())
             }
             EditorMode::Edit { location, index } => {
                 let Some(workspace) = self.selected_workspace_mut() else {
@@ -847,7 +839,10 @@ impl App {
                 self.draft_timing = timing;
                 self.detailed_editor = None;
                 if matches!(mode, EditorMode::Add) {
-                    self.selected_detailed = self.working_dtds().len().checked_sub(1);
+                    self.selected_detailed = self
+                        .working_dtds()
+                        .iter()
+                        .position(|row| row.location == location);
                 } else if matches!(mode, EditorMode::AddCta { .. }) {
                     self.selected_extension = self.extension_row_index_for_location(location);
                 }
@@ -958,8 +953,13 @@ impl App {
         match result {
             Ok(()) => {
                 self.selected_detailed = None;
+                self.selected_standard = None;
                 self.selected_established = None;
                 self.selected_extension = None;
+                self.established_scroll = 0;
+                self.detailed_scroll = 0;
+                self.standard_scroll = 0;
+                self.extension_scroll = 0;
                 self.import_dialog = None;
                 self.details_dialog = None;
                 self.status = format!("Imported EDID from {} into workspace.", path.display());
@@ -1173,21 +1173,28 @@ impl App {
     }
 
     fn selected_or_first_free_cta_slot(&self) -> Option<(u8, usize)> {
-        if let Some(row) = self.selected_extension_slot()
-            && row.timing.is_none()
-            && !row.occupied_unknown
+        let preferred_extension = match self.selected_extension_row() {
+            Some(ExtensionRow::Dtd(row)) => Some(row.extension_index),
+            Some(ExtensionRow::Video {
+                extension_index, ..
+            }) => Some(extension_index),
+            _ => None,
+        };
+        let slots = self.working_cta_dtd_slots();
+        if let Some(extension_index) = preferred_extension
+            && let Some(row) = slots.iter().find(|row| {
+                row.extension_index == extension_index
+                    && row.timing.is_none()
+                    && !row.occupied_unknown
+            })
         {
             return Some((row.extension_index, row.slot));
         }
 
-        self.working_extension_rows()
+        slots
             .into_iter()
-            .find_map(|row| match row {
-                ExtensionRow::Dtd(row) if row.timing.is_none() && !row.occupied_unknown => {
-                    Some((row.extension_index, row.slot))
-                }
-                _ => None,
-            })
+            .find(|row| row.timing.is_none() && !row.occupied_unknown)
+            .map(|row| (row.extension_index, row.slot))
     }
 
     fn selected_switch_mode(&self) -> Option<SwitchModeCandidate> {
@@ -1463,12 +1470,17 @@ impl App {
             return;
         };
         let monitor = monitor.clone();
-        if let Err(error) = install::validate_connector_mapping(
-            &monitor.connector,
-            self.monitors
-                .iter()
-                .map(|monitor| monitor.connector.as_str()),
-        ) {
+        let connector_check = if monitor.drm_path.is_some() {
+            install::validate_system_connector_mapping(&monitor.connector)
+        } else {
+            install::validate_connector_mapping(
+                &monitor.connector,
+                self.monitors
+                    .iter()
+                    .map(|monitor| monitor.connector.as_str()),
+            )
+        };
+        if let Err(error) = connector_check {
             self.status = error;
             return;
         }
@@ -1482,10 +1494,6 @@ impl App {
             SystemOperation::Install
         };
 
-        let Ok(output_dir) = std::env::current_dir() else {
-            self.status = "Could not determine current output directory.".to_string();
-            return;
-        };
         let Some(workspace) = self
             .selected_workspace()
             .filter(|workspace| workspace.has_changes())
@@ -1522,7 +1530,7 @@ impl App {
         let edid_file_name = custom_edid_file_name(&connector);
         let plan = InstallPlan {
             connector: connector.clone(),
-            edid_source: output_dir.join(&edid_file_name),
+            edid_source: PathBuf::from("staged workspace EDID"),
             kernel_parameter: format!("drm.edid_firmware={connector}:edid/{edid_file_name}"),
             edid_file_name,
         };
@@ -1573,8 +1581,6 @@ impl App {
         self.pending_system_action = Some(PendingSystemAction::Install {
             monitor: Box::new(monitor),
             workspace: Box::new(workspace),
-            hyprland_mode,
-            output_dir,
             operation,
         });
         self.apply_confirm_dialog = Some(ApplyConfirmDialog::new(operation, summary_lines));
@@ -1670,30 +1676,25 @@ impl App {
 
         let execution = match action {
             PendingSystemAction::Install {
-                monitor,
-                workspace,
-                hyprland_mode,
-                output_dir,
-                ..
+                monitor, workspace, ..
             } => {
-                let export_result = match export_workspace_edid(
-                    &monitor,
-                    &workspace,
-                    &hyprland_mode,
-                    &output_dir,
-                ) {
-                    Ok(result) => result,
+                let staged_path = match install::stage_temp_edid(&workspace.export_bytes()) {
+                    Ok(path) => path,
                     Err(error) => {
                         self.apply_confirm_dialog = None;
-                        self.status = format!("Apply failed during export: {error}");
+                        self.status = format!("Apply failed while staging EDID: {error}");
                         return;
                     }
                 };
+                let connector = monitor.connector;
+                let edid_file_name = custom_edid_file_name(&connector);
+                let kernel_parameter =
+                    format!("drm.edid_firmware={connector}:edid/{edid_file_name}");
                 SystemExecution::Install(InstallPlan {
-                    connector: monitor.connector,
-                    edid_source: export_result.path,
-                    edid_file_name: export_result.plan.edid_file_name.clone(),
-                    kernel_parameter: export_result.plan.drm_kernel_parameter(),
+                    connector,
+                    edid_source: staged_path,
+                    edid_file_name,
+                    kernel_parameter,
                 })
             }
             PendingSystemAction::Uninstall(plan) => SystemExecution::Uninstall(plan),
@@ -1714,7 +1715,11 @@ impl App {
 
         std::thread::spawn(move || {
             let result = match execution {
-                SystemExecution::Install(plan) => install::install(&plan),
+                SystemExecution::Install(plan) => {
+                    let result = install::install(&plan);
+                    let _ = fs::remove_file(&plan.edid_source);
+                    result
+                }
                 SystemExecution::Uninstall(plan) => install::uninstall(&plan),
             };
             let _ = tx.send((operation, result));
@@ -1968,12 +1973,16 @@ fn append_override_status_lines(
         "mkinitcpio FILES:   {}",
         yes_no(status.mkinitcpio_references_firmware)
     ));
-    lines.push(format!(
-        "Bootloader config:  {} ({}/{} cmdline entries)",
-        yes_no(status.bootloader_references_kernel_parameter),
-        status.bootloader_cmdline_entries_with_kernel_parameter,
-        status.bootloader_cmdline_entries
-    ));
+    if status.bootloader_validation_deferred {
+        lines.push("Bootloader config:  deferred (permission denied)".to_string());
+    } else {
+        lines.push(format!(
+            "Bootloader config:  {} ({}/{} cmdline entries)",
+            yes_no(status.bootloader_references_kernel_parameter),
+            status.bootloader_cmdline_entries_with_kernel_parameter,
+            status.bootloader_cmdline_entries
+        ));
+    }
     lines.push(format!(
         "Limine entry-tool:  {}",
         yes_no(status.limine_entry_tool_references_kernel_parameter)
@@ -2116,6 +2125,10 @@ fn append_config_inspection_lines(lines: &mut Vec<String>, report: &MonitorRuleI
             "Config result: the selected mode is the last literal rule found; dynamic Lua may still override it."
                 .to_string(),
         );
+    } else if let Some(location) = &report.uncertain_override {
+        lines.push(format!(
+            "Config result: uncertain — a later dynamic or unsupported monitor rule/include at {location} may override the exact rule."
+        ));
     } else if report.exact_match.is_some() {
         lines.push(
             "Config result: a later literal connector rule may override the exact rule."
@@ -2205,10 +2218,19 @@ pub(super) fn read_import_file(path: &Path) -> std::io::Result<Vec<u8>> {
             format!("larger than the {MAX_IMPORT_LEN}-byte EDID maximum"),
         ));
     }
+    let file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if opened.len() > MAX_IMPORT_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("larger than the {MAX_IMPORT_LEN}-byte EDID maximum"),
+        ));
+    }
     let mut raw = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_IMPORT_LEN + 1)
-        .read_to_end(&mut raw)?;
+    file.take(MAX_IMPORT_LEN + 1).read_to_end(&mut raw)?;
     if raw.len() as u64 > MAX_IMPORT_LEN {
         return Err(Error::new(
             ErrorKind::InvalidData,

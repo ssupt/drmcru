@@ -94,6 +94,8 @@ pub fn patch_vrr_range(raw: &[u8], range: VrrRange) -> Result<Vec<u8>, EdidError
 }
 
 const HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+const BASE_DUMMY_DESCRIPTOR: [u8; DTD_LEN] =
+    [0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 const BASE_BLOCK_LEN: usize = 128;
 const EDID_BLOCK_LEN: usize = 128;
 const DTD_START: usize = 54;
@@ -220,7 +222,7 @@ pub fn slot_summary(raw: &[u8]) -> Result<EdidSlotSummary, EdidError> {
         .filter(|descriptor| parse_detailed_timing(*descriptor).is_some())
         .count();
     let base_dtd_free = base_descriptors
-        .filter(|descriptor| descriptor.iter().all(|byte| *byte == 0))
+        .filter(|descriptor| is_empty_base_descriptor(*descriptor))
         .count();
     let standard_used = parse_standard_timings(&raw[..BASE_BLOCK_LEN]).len();
     let standard_free = raw[STANDARD_TIMING_START
@@ -479,7 +481,7 @@ pub fn delete_detailed_timing(raw: &[u8], location: DtdLocation) -> Result<Vec<u
         patched.copy_within(offset + DTD_LEN..end, offset);
         patched[end - DTD_LEN..end].fill(0);
     } else {
-        patched[offset..offset + DTD_LEN].fill(0);
+        patched[offset..offset + DTD_LEN].copy_from_slice(&BASE_DUMMY_DESCRIPTOR);
     }
     repair_block_checksum(&mut patched[block_start..block_start + EDID_BLOCK_LEN]);
     Ok(patched)
@@ -630,10 +632,10 @@ pub fn encode_detailed_timing(timing: &TimingDescriptor) -> Result<[u8; DTD_LEN]
     validate_6_bit("v_front_porch", v_front_porch)?;
     validate_6_bit("v_sync_width", v_sync_width)?;
 
-    let pixel_clock_10khz = timing.pixel_clock_khz / 10;
-    if pixel_clock_10khz == 0 {
+    if timing.pixel_clock_khz < 10 {
         return Err(EdidError::PixelClockTooSmall(timing.pixel_clock_khz));
     }
+    let pixel_clock_10khz = timing.pixel_clock_khz.saturating_add(5) / 10;
     if pixel_clock_10khz > u32::from(u16::MAX) {
         return Err(EdidError::PixelClockTooLarge(timing.pixel_clock_khz));
     }
@@ -1106,12 +1108,14 @@ fn cta_vic_mode(vic: u16, native: bool) -> Option<CtaVideoMode> {
         34 => (1920, 1080, 30_000, false),
         40 => (1920, 1080, 100_000, true),
         41 => (1280, 720, 100_000, false),
-        47 => (1920, 1080, 120_000, true),
-        48 => (1280, 720, 120_000, false),
-        61 => (1280, 720, 24_000, false),
-        62 => (1280, 720, 25_000, false),
-        63 => (1280, 720, 30_000, false),
-        64 => (1920, 1080, 120_000, false),
+        46 => (1920, 1080, 120_000, true),
+        47 => (1280, 720, 120_000, false),
+        48 | 49 => (720, 480, 120_000, false),
+        60 => (1280, 720, 24_000, false),
+        61 => (1280, 720, 25_000, false),
+        62 => (1280, 720, 30_000, false),
+        63 => (1920, 1080, 120_000, false),
+        64 => (1920, 1080, 100_000, false),
         93 => (3840, 2160, 24_000, false),
         94 => (3840, 2160, 25_000, false),
         95 => (3840, 2160, 30_000, false),
@@ -1135,13 +1139,17 @@ fn cta_vic_mode(vic: u16, native: bool) -> Option<CtaVideoMode> {
     })
 }
 
+fn is_empty_base_descriptor(descriptor: &[u8]) -> bool {
+    descriptor.iter().all(|byte| *byte == 0) || descriptor[..5] == [0, 0, 0, 0x10, 0]
+}
+
 fn base_empty_dtd_slot(raw: &[u8]) -> Option<(usize, usize)> {
     raw[DTD_START..126]
         .as_chunks::<DTD_LEN>()
         .0
         .iter()
         .enumerate()
-        .find(|(_, descriptor)| descriptor.iter().all(|byte| *byte == 0))
+        .find(|(_, descriptor)| is_empty_base_descriptor(*descriptor))
         .map(|(slot, _)| (slot, DTD_START + slot * DTD_LEN))
 }
 
@@ -2219,5 +2227,79 @@ mod tests {
             .find(|slot| slot.extension_index == 2 && slot.slot == 0)
             .expect("inserted slot");
         assert_eq!(inserted.timing.as_ref(), Some(&timing));
+    }
+
+    #[test]
+    fn cta_vic_table_matches_cta_861_high_refresh_and_720p_codes() {
+        for (vic, expected) in [
+            (46, (1920, 1080, 120_000, true)),
+            (47, (1280, 720, 120_000, false)),
+            (48, (720, 480, 120_000, false)),
+            (60, (1280, 720, 24_000, false)),
+            (61, (1280, 720, 25_000, false)),
+            (62, (1280, 720, 30_000, false)),
+            (63, (1920, 1080, 120_000, false)),
+            (64, (1920, 1080, 100_000, false)),
+        ] {
+            let mode = cta_vic_mode(vic, false).unwrap_or_else(|| panic!("VIC {vic} missing"));
+            assert_eq!(
+                (
+                    mode.width,
+                    mode.height,
+                    mode.refresh_millihz,
+                    mode.interlaced
+                ),
+                expected,
+                "VIC {vic}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_dummy_descriptors_count_as_free_and_base_delete_writes_dummy_tag() {
+        let mut edid = minimal_base_edid(0);
+        // Populate slots 0..4 with VESA dummy descriptors (0x10).
+        for slot in 0..DTD_SLOTS {
+            let offset = DTD_START + slot * DTD_LEN;
+            edid[offset..offset + DTD_LEN].copy_from_slice(&BASE_DUMMY_DESCRIPTOR);
+        }
+        repair_block_checksum(&mut edid);
+
+        let summary = slot_summary(&edid).unwrap();
+        assert_eq!(summary.base_dtd_used, 0);
+        assert_eq!(summary.base_dtd_free, 4);
+
+        let (patched, location) = insert_detailed_timing(&edid, &sample_timing()).unwrap();
+        assert_eq!(location, DtdLocation::Base { slot: 0 });
+        assert_eq!(slot_summary(&patched).unwrap().base_dtd_free, 3);
+
+        let deleted = delete_detailed_timing(&patched, location).unwrap();
+        assert_eq!(
+            &deleted[DTD_START..DTD_START + DTD_LEN],
+            &BASE_DUMMY_DESCRIPTOR
+        );
+        assert!(block_checksum_valid(&deleted));
+        assert_eq!(slot_summary(&deleted).unwrap().base_dtd_free, 4);
+    }
+
+    #[test]
+    fn encode_detailed_timing_rounds_pixel_clock_to_nearest_10_khz() {
+        let mut timing = sample_timing();
+        timing.pixel_clock_khz = 148_506;
+        let encoded = encode_detailed_timing(&timing).unwrap();
+        let parsed = parse_detailed_timing(&encoded).unwrap();
+        assert_eq!(parsed.pixel_clock_khz, 148_510);
+
+        let mut large = TimingDescriptor {
+            h_active: 65_000,
+            h_blanking: 1_000,
+            v_active: 65_000,
+            v_blanking: 1_000,
+            ..sample_timing()
+        };
+        assert_eq!(large.h_total(), 66_000);
+        assert_eq!(large.v_total(), 66_000);
+        large.pixel_clock_khz = 655_350;
+        assert!(large.refresh_hz().unwrap().is_finite());
     }
 }
