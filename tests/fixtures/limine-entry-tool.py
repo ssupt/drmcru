@@ -8,7 +8,9 @@ import shutil
 import sys
 
 root = Path(os.environ['TEST_ROOT'])
-machine = '0' * 32
+machine = (root / 'machine-id').read_text().strip() if (root / 'machine-id').is_file() else '0' * 32
+custom_uki = os.environ.get('TEST_CUSTOM_UKI_NAME', '')
+uki_prefix = custom_uki if re.fullmatch(r'[a-z0-9]+', custom_uki) else machine
 args = sys.argv[1:]
 
 def resolve(key):
@@ -54,7 +56,7 @@ if args[0] in ('--remove-kernel', '--remove-uki'):
     if args[0] == '--remove-kernel':
         shutil.rmtree(boot / machine / name)
     else:
-        (boot / 'EFI/Linux' / f'{machine}_{name}.efi').unlink()
+        (boot / 'EFI/Linux' / f'{uki_prefix}_{name}.efi').unlink()
     sys.exit(0)
 if args[0] == '--add-kernel':
     name, kernel, image = args[1:4]
@@ -69,7 +71,7 @@ if args[0] == '--add-kernel':
              f'  module_path: boot():/{target.relative_to(boot)}', f'  cmdline: {resolve(key)}']
 elif args[0] == '--add-uki':
     key, image = args[1:3]
-    target = boot / 'EFI/Linux' / f'{machine}_{key}.efi'
+    target = boot / 'EFI/Linux' / f'{uki_prefix}_{key}.efi'
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(image, target)
     lines = [f'/{key}', '  protocol: efi', f'  path: boot():/{target.relative_to(boot)}', f'  cmdline: {resolve(key)}']

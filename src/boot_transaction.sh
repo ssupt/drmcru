@@ -225,8 +225,14 @@ check_boot_partition "$BOOT_ROOT"
 [ -s "$MACHINE_ID_FILE" ] || die "Machine ID is missing"
 MACHINE_ID="$(cat "$MACHINE_ID_FILE")"
 [[ "$MACHINE_ID" =~ ^[a-fA-F0-9]{32}$ ]] || die "Invalid machine ID"
-UKI_PREFIX="${CUSTOM_UKI_NAME:-$MACHINE_ID}"
-[[ "$UKI_PREFIX" =~ ^[A-Za-z0-9._-]+$ && "$UKI_PREFIX" != . && "$UKI_PREFIX" != .. ]] || die "Invalid custom UKI prefix"
+UKI_PREFIX="$MACHINE_ID"
+if [ -n "${CUSTOM_UKI_NAME:-}" ]; then
+    if [[ "$CUSTOM_UKI_NAME" =~ ^[a-z0-9]+$ ]]; then
+        UKI_PREFIX="$CUSTOM_UKI_NAME"
+    else
+        echo "[WARN] Ignoring invalid CUSTOM_UKI_NAME; Limine falls back to machine ID" >&2
+    fi
+fi
 IMAGE_KIND=initramfs; EMBED_CMDLINE=1
 if [ "${ENABLE_UKI:-no}" = yes ] && is_uefi; then
     IMAGE_KIND=uki

@@ -54,16 +54,20 @@ pub struct MonitorRuleInspection {
     pub connector_rules: Vec<MonitorRule>,
     pub exact_match: Option<MonitorRule>,
     pub last_connector_rule: Option<MonitorRule>,
+    pub uncertain_override: Option<String>,
     pub read_warnings: Vec<String>,
 }
 
 impl MonitorRuleInspection {
     pub fn exact_match_is_effective(&self) -> bool {
-        self.exact_match.as_ref().is_some_and(|exact| {
-            self.last_connector_rule.as_ref().is_some_and(|last| {
-                exact.path == last.path && exact.line_number == last.line_number
+        self.uncertain_override.is_none()
+            && self.exact_match.as_ref().is_some_and(|exact| {
+                self.last_connector_rule.as_ref().is_some_and(|last| {
+                    exact.path == last.path
+                        && exact.line_number == last.line_number
+                        && exact.normalized_rule() == last.normalized_rule()
+                })
             })
-        })
     }
 }
 
@@ -122,21 +126,41 @@ fn inspect_monitor_rule_from(
 
     let normalized_expected = normalize_monitor_rule(expected_rule);
 
-    let connector_rules = parser
-        .monitor_rules
-        .into_iter()
-        .filter(|rule| rule.connector == connector)
-        .collect::<Vec<_>>();
-    let exact_match = connector_rules
-        .iter()
-        .rev()
-        .find(|rule| {
-            normalized_expected
+    let mut connector_rules = Vec::new();
+    let mut last_exact_entry_index = None;
+    let mut exact_match = None;
+    for (index, entry) in parser.entries.iter().enumerate() {
+        if let MonitorEntry::Literal(rule) = entry
+            && rule.connector == connector
+        {
+            if normalized_expected
                 .as_ref()
                 .is_some_and(|expected| rule.normalized_rule() == *expected)
-        })
-        .cloned();
+            {
+                last_exact_entry_index = Some(index);
+                exact_match = Some(rule.clone());
+            }
+            connector_rules.push(rule.clone());
+        }
+    }
     let last_connector_rule = connector_rules.last().cloned();
+    let uncertain_override = last_exact_entry_index.and_then(|exact_index| {
+        parser.entries[exact_index + 1..]
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                MonitorEntry::Dynamic {
+                    connector: dynamic_connector,
+                    location,
+                } if dynamic_connector
+                    .as_deref()
+                    .is_none_or(|name| name == connector) =>
+                {
+                    Some(location.clone())
+                }
+                _ => None,
+            })
+    });
 
     MonitorRuleInspection {
         root_path,
@@ -145,6 +169,7 @@ fn inspect_monitor_rule_from(
         connector_rules,
         exact_match,
         last_connector_rule,
+        uncertain_override,
         read_warnings: parser.read_warnings,
     }
 }
@@ -177,6 +202,22 @@ fn lua_string(value: &str) -> String {
     )
 }
 
+enum MonitorEntry {
+    Literal(MonitorRule),
+    Dynamic {
+        connector: Option<String>,
+        location: String,
+    },
+}
+
+enum LuaMonitorParse {
+    Literal(MonitorRule),
+    Dynamic {
+        connector: Option<String>,
+        line_number: usize,
+    },
+}
+
 #[derive(Default)]
 struct ConfigParser {
     // Only active includes are guarded; source/dofile can load a file again.
@@ -184,7 +225,7 @@ struct ConfigParser {
     required: BTreeSet<PathBuf>,
     files_read: usize,
     hit_file_limit: bool,
-    monitor_rules: Vec<MonitorRule>,
+    entries: Vec<MonitorEntry>,
     read_warnings: Vec<String>,
 }
 
@@ -226,6 +267,10 @@ impl ConfigParser {
                     human_path(path)
                 ));
             }
+            self.entries.push(MonitorEntry::Dynamic {
+                connector: None,
+                location: human_path(path),
+            });
             self.seen.remove(&seen_path);
             return;
         }
@@ -245,28 +290,64 @@ impl ConfigParser {
             for call in find_lua_calls(&contents) {
                 match call.kind {
                     LuaCallKind::Monitor => {
-                        if let Some(rule) =
-                            parse_lua_monitor_rule(&display_path, &contents, call.start, call.end)
+                        match parse_lua_monitor_call(&display_path, &contents, call.start, call.end)
                         {
-                            self.monitor_rules.push(rule);
+                            LuaMonitorParse::Literal(rule) => {
+                                self.entries.push(MonitorEntry::Literal(rule));
+                            }
+                            LuaMonitorParse::Dynamic {
+                                connector,
+                                line_number,
+                            } => {
+                                let location =
+                                    format!("{}:{line_number}", human_path(&display_path));
+                                self.read_warnings
+                                    .push(format!("Skipped dynamic monitor rule at {location}"));
+                                self.entries.push(MonitorEntry::Dynamic {
+                                    connector,
+                                    location,
+                                });
+                            }
                         }
                     }
                     LuaCallKind::DoFile => {
                         let Some(value) = parse_literal_lua_call_argument(call.raw(&contents))
                         else {
                             // Dynamic bootstrap expressions are common in Hyprland 0.56 and
-                            // Omarchy. They cannot be resolved safely without executing Lua.
+                            // Omarchy. Record their position so later dynamic includes make
+                            // earlier matches uncertain without failing top-of-file bootstraps.
+                            let line_number = line_number_at(&contents, call.start);
+                            self.entries.push(MonitorEntry::Dynamic {
+                                connector: None,
+                                location: format!("{}:{line_number}", human_path(&display_path)),
+                            });
                             continue;
                         };
-                        for source in
-                            resolve_source_paths(&value, &display_path, &mut self.read_warnings)
+                        let resolved =
+                            resolve_source_paths(&value, &display_path, &mut self.read_warnings);
+                        if resolved.is_empty()
+                            && path_contains_unsupported_glob(&PathBuf::from(expand_config_path(
+                                &value,
+                            )))
                         {
+                            let line_number = line_number_at(&contents, call.start);
+                            self.entries.push(MonitorEntry::Dynamic {
+                                connector: None,
+                                location: format!("{}:{line_number}", human_path(&display_path)),
+                            });
+                        }
+                        for source in resolved {
                             self.read_file(&source);
                         }
                     }
                     LuaCallKind::Require => {
                         let Some(module) = parse_literal_lua_call_argument(call.raw(&contents))
                         else {
+                            let line_number = line_number_at(&contents, call.start);
+                            self.entries.push(MonitorEntry::Dynamic {
+                                connector: None,
+                                location: format!("{}:{line_number}", human_path(&display_path)),
+                            });
                             continue;
                         };
                         if let Some(source) = resolve_lua_require(&module, &display_path) {
@@ -294,18 +375,35 @@ impl ConfigParser {
                     if let Some(rule) =
                         parse_monitor_rule(&display_path, line_number, raw_line, value)
                     {
-                        self.monitor_rules.push(rule);
+                        self.entries.push(MonitorEntry::Literal(rule));
                     } else if value.contains('$') {
-                        self.read_warnings.push(format!(
-                            "Skipped dynamic monitor rule at {}:{line_number}",
-                            human_path(&display_path)
-                        ));
+                        let connector = value
+                            .split(',')
+                            .next()
+                            .map(str::trim)
+                            .filter(|part| !part.is_empty() && !part.contains('$'))
+                            .map(str::to_string);
+                        let location = format!("{}:{line_number}", human_path(&display_path));
+                        self.read_warnings
+                            .push(format!("Skipped dynamic monitor rule at {location}"));
+                        self.entries.push(MonitorEntry::Dynamic {
+                            connector,
+                            location,
+                        });
                     }
                 }
                 "source" => {
-                    for source in
-                        resolve_source_paths(value, &display_path, &mut self.read_warnings)
+                    let resolved =
+                        resolve_source_paths(value, &display_path, &mut self.read_warnings);
+                    if resolved.is_empty()
+                        && path_contains_unsupported_glob(&PathBuf::from(expand_config_path(value)))
                     {
+                        self.entries.push(MonitorEntry::Dynamic {
+                            connector: None,
+                            location: format!("{}:{line_number}", human_path(&display_path)),
+                        });
+                    }
+                    for source in resolved {
                         self.read_file(&source);
                     }
                 }
@@ -517,45 +615,138 @@ fn skip_quoted_lua_string(bytes: &[u8], start: usize) -> usize {
     find_quoted_lua_string_end(bytes, start).map_or(bytes.len(), |end| end + 1)
 }
 
-fn parse_lua_monitor_rule(
+fn line_number_at(contents: &str, start: usize) -> usize {
+    contents[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn parse_lua_monitor_call(
     path: &Path,
     contents: &str,
     start: usize,
     end: usize,
-) -> Option<MonitorRule> {
+) -> LuaMonitorParse {
     let raw = &contents[start..=end];
-    let fields = parse_lua_table_fields(raw);
-    let connector = fields.iter().rfind(|(key, _)| key == "output")?;
-    let mode = fields
-        .iter()
-        .rfind(|(key, _)| key == "mode")
-        .map(|(_, value)| value.clone())
-        .or_else(|| {
-            fields
-                .iter()
-                .rfind(|(key, _)| key == "disabled")
-                .is_some_and(|(_, value)| value == "true")
-                .then(|| "disabled".to_string())
-        })?;
-    Some(MonitorRule {
+    let line_number = line_number_at(contents, start);
+    let without_comments = strip_lua_comments(raw);
+    let Some(table_body) = extract_lua_table_body(&without_comments) else {
+        return LuaMonitorParse::Dynamic {
+            connector: None,
+            line_number,
+        };
+    };
+
+    let mut output: Option<String> = None;
+    let mut mode: Option<String> = None;
+    let mut position: Option<String> = None;
+    let mut scale: Option<String> = None;
+    let mut disabled: Option<bool> = None;
+    let mut has_dynamic_output = false;
+    let mut has_dynamic_field = false;
+
+    for entry in split_lua_table_entries(table_body) {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = split_lua_table_entry(trimmed) else {
+            has_dynamic_field = true;
+            has_dynamic_output = true;
+            continue;
+        };
+        match key.as_str() {
+            "output" => {
+                if let Some(parsed) = parse_lua_string_literal(value) {
+                    output = Some(parsed);
+                    has_dynamic_output = false;
+                } else {
+                    has_dynamic_output = true;
+                    has_dynamic_field = true;
+                }
+            }
+            "mode" => {
+                if let Some(parsed) = parse_lua_string_literal(value) {
+                    mode = Some(parsed);
+                } else {
+                    has_dynamic_field = true;
+                }
+            }
+            "position" => {
+                if let Some(parsed) = parse_lua_string_literal(value) {
+                    position = Some(parsed);
+                } else {
+                    has_dynamic_field = true;
+                }
+            }
+            "scale" => {
+                if let Some(parsed) = parse_lua_scale_literal(value) {
+                    scale = Some(parsed);
+                } else {
+                    has_dynamic_field = true;
+                }
+            }
+            "disabled" => match value {
+                "true" => disabled = Some(true),
+                "false" => disabled = Some(false),
+                _ => has_dynamic_field = true,
+            },
+            _ => {}
+        }
+    }
+
+    if has_dynamic_field {
+        return LuaMonitorParse::Dynamic {
+            connector: (!has_dynamic_output).then_some(output).flatten(),
+            line_number,
+        };
+    }
+
+    let resolved_mode = if disabled == Some(true) {
+        Some("disabled".to_string())
+    } else {
+        mode
+    };
+    let (Some(connector), Some(resolved_mode)) = (output.clone(), resolved_mode) else {
+        return LuaMonitorParse::Dynamic {
+            connector: output,
+            line_number,
+        };
+    };
+
+    LuaMonitorParse::Literal(MonitorRule {
         path: path.to_path_buf(),
-        line_number: contents[..start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            + 1,
+        line_number,
         raw: raw.to_string(),
-        connector: connector.1.clone(),
-        mode,
-        position: fields
-            .iter()
-            .rfind(|(key, _)| key == "position")
-            .map(|(_, value)| value.clone()),
-        scale: fields
-            .iter()
-            .rfind(|(key, _)| key == "scale")
-            .map(|(_, value)| value.clone()),
+        connector,
+        mode: resolved_mode,
+        position,
+        scale,
     })
+}
+
+fn extract_lua_table_body(without_comments: &str) -> Option<&str> {
+    let mut rest = without_comments.trim();
+    if let Some(after_name) = rest.strip_prefix("hl.monitor") {
+        rest = after_name.trim();
+    }
+    if rest.starts_with('(') {
+        let close = find_balanced_lua_delim(rest, 0, b'(', b')')?;
+        if close + 1 != rest.len() {
+            return None;
+        }
+        rest = rest[1..close].trim();
+    }
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let close = find_balanced_lua_delim(rest, 0, b'{', b'}')?;
+    if close + 1 != rest.len() {
+        return None;
+    }
+    Some(&rest[1..close])
 }
 
 fn find_balanced_lua_delim(
@@ -591,47 +782,6 @@ fn find_balanced_lua_delim(
         index += 1;
     }
     None
-}
-
-fn parse_lua_table_fields(raw: &str) -> Vec<(String, String)> {
-    let without_comments = strip_lua_comments(raw);
-    let mut rest = without_comments.trim();
-    if let Some(after_name) = rest.strip_prefix("hl.monitor") {
-        rest = after_name.trim();
-    }
-    if rest.starts_with('(') {
-        let Some(close) = find_balanced_lua_delim(rest, 0, b'(', b')') else {
-            return Vec::new();
-        };
-        if close + 1 != rest.len() {
-            return Vec::new();
-        }
-        rest = rest[1..close].trim();
-    }
-    if !rest.starts_with('{') {
-        return Vec::new();
-    }
-    let Some(close) = find_balanced_lua_delim(rest, 0, b'{', b'}') else {
-        return Vec::new();
-    };
-    if close + 1 != rest.len() {
-        return Vec::new();
-    }
-    let table_body = &rest[1..close];
-
-    split_lua_table_entries(table_body)
-        .into_iter()
-        .filter_map(|entry| {
-            let (key, value) = split_lua_table_entry(entry)?;
-            let parsed = match key.as_str() {
-                "output" | "mode" | "position" => parse_lua_string_literal(value)?,
-                "scale" => parse_lua_scale_literal(value)?,
-                "disabled" if matches!(value, "true" | "false") => value.to_string(),
-                _ => return None,
-            };
-            Some((key, parsed))
-        })
-        .collect()
 }
 
 fn split_lua_table_entries(table_body: &str) -> Vec<&str> {
@@ -864,9 +1014,11 @@ fn normalize_monitor_rule(rule: &str) -> Option<String> {
         .into_iter()
         .find(|call| call.kind == LuaCallKind::Monitor)
         .and_then(|call| {
-            parse_lua_monitor_rule(Path::new("<expected>"), rule, call.start, call.end)
+            match parse_lua_monitor_call(Path::new("<expected>"), rule, call.start, call.end) {
+                LuaMonitorParse::Literal(parsed) => Some(parsed.normalized_rule()),
+                LuaMonitorParse::Dynamic { .. } => None,
+            }
         })
-        .map(|parsed| parsed.normalized_rule())
 }
 
 fn parse_assignment(line: &str) -> Option<(&str, &str)> {
@@ -1495,14 +1647,98 @@ mod tests {
             "monitor=dynamic_connector,1920x1080@60",
         );
         assert!(dynamic.connector_rules.is_empty());
-        assert!(dynamic.read_warnings.is_empty());
+        assert!(!dynamic.exact_match_is_effective());
+        assert_eq!(dynamic.read_warnings.len(), 3);
 
         let dp1 = inspect_monitor_rule_from(root, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
-        assert_eq!(dp1.connector_rules.len(), 1);
-        assert_eq!(dp1.connector_rules[0].mode, "1920x1080@60");
-        assert_eq!(dp1.connector_rules[0].position, None);
-        assert_eq!(dp1.connector_rules[0].scale, None);
+        assert!(dp1.connector_rules.is_empty());
         assert!(!dp1.exact_match_is_effective());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_dynamic_lua_or_conf_override_makes_earlier_exact_match_uncertain() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        // Exact reproducer: later Lua rule using mode = preferred_mode.
+        let lua_mode = dir.join("mode_override.lua");
+        fs::write(
+            &lua_mode,
+            "hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             hl.monitor({ output = 'DP-1', mode = preferred_mode, position = '0x0', scale = 1 })\n",
+        )
+        .unwrap();
+        let report = inspect_monitor_rule_from(lua_mode, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(
+            report
+                .uncertain_override
+                .as_deref()
+                .is_some_and(|location| location.ends_with(":2"))
+        );
+
+        // Later dynamic output / non-table call / dynamic include also makes match uncertain.
+        let lua_unknown = dir.join("unknown_override.lua");
+        fs::write(
+            &lua_unknown,
+            "hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             hl.monitor(monitor_table)\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(lua_unknown, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(report.uncertain_override.is_some());
+
+        let lua_dofile = dir.join("dofile_override.lua");
+        fs::write(
+            &lua_dofile,
+            "hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             dofile(config_dir .. '/extra.lua')\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(lua_dofile, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(report.uncertain_override.is_some());
+
+        // Dynamic rule targeting a DIFFERENT connector does not invalidate DP-1,
+        // and an earlier dynamic rule overridden by a later exact match stays effective.
+        let lua_other = dir.join("other_connector.lua");
+        fs::write(
+            &lua_other,
+            "hl.monitor({ output = 'DP-1', mode = preferred_mode })\n\
+             hl.monitor({ output = 'DP-1', mode = '1920x1080@60', position = '0x0', scale = 1 })\n\
+             hl.monitor({ output = 'HDMI-A-1', mode = preferred_mode })\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(lua_other, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match_is_effective());
+        assert_eq!(report.uncertain_override, None);
+
+        // Dynamic .conf override after exact match also marks persistence uncertain.
+        let conf_dynamic = dir.join("dynamic.conf");
+        fs::write(
+            &conf_dynamic,
+            "monitor=DP-1,1920x1080@60,0x0,1\nmonitor=DP-1,$CUSTOM_MODE,0x0,1\n",
+        )
+        .unwrap();
+        let report =
+            inspect_monitor_rule_from(conf_dynamic, "DP-1", "monitor=DP-1,1920x1080@60,0x0,1");
+        assert!(report.exact_match.is_some());
+        assert!(!report.exact_match_is_effective());
+        assert!(
+            report
+                .uncertain_override
+                .as_deref()
+                .is_some_and(|location| location.ends_with(":2"))
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

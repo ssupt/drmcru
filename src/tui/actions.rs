@@ -2125,6 +2125,10 @@ fn append_config_inspection_lines(lines: &mut Vec<String>, report: &MonitorRuleI
             "Config result: the selected mode is the last literal rule found; dynamic Lua may still override it."
                 .to_string(),
         );
+    } else if let Some(location) = &report.uncertain_override {
+        lines.push(format!(
+            "Config result: uncertain — a later dynamic or unsupported monitor rule/include at {location} may override the exact rule."
+        ));
     } else if report.exact_match.is_some() {
         lines.push(
             "Config result: a later literal connector rule may override the exact rule."

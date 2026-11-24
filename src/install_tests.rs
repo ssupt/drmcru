@@ -73,6 +73,7 @@ impl ScriptFixture {
 load_config() {
     ESP_PATH="$TEST_ROOT/boot"
     ENABLE_UKI="$TEST_UKI"
+    CUSTOM_UKI_NAME="${TEST_CUSTOM_UKI_NAME:-}"
     MKINITCPIO_FALLBACK="$TEST_FALLBACK"
 }
 check_boot_partition() { return 0; }
@@ -1359,25 +1360,100 @@ fn mkinitcpio_dropin_symlink_to_regular_file_is_rejected_early() {
 }
 
 #[test]
-fn custom_uki_prefix_accepts_hyphens_and_underscores() {
+fn uki_prefix_matches_limine_fallback_and_valid_custom_names() {
+    let setup_uki_only_boot = |fixture: &ScriptFixture, prefix: &str| {
+        let legacy_dir = fixture.dir.join(format!("boot/{MACHINE}"));
+        if legacy_dir.exists() {
+            fs::remove_dir_all(&legacy_dir).unwrap();
+        }
+        let uki_dir = fixture.dir.join("boot/EFI/Linux");
+        fs::create_dir_all(&uki_dir).unwrap();
+        fs::write(uki_dir.join(format!("{prefix}_linux-test.efi")), b"old-uki").unwrap();
+        fs::write(
+            fixture.dir.join("boot/limine.conf"),
+            format!(
+                "/linux-test\n  protocol: efi\n  path: boot():/EFI/Linux/{prefix}_linux-test.efi\n  cmdline: {BASE_ARGS}\n"
+            ),
+        )
+        .unwrap();
+    };
+
+    // Invalid CUSTOM_UKI_NAME (hyphens/underscores): Limine falls back to MACHINE_ID.
     let fixture = ScriptFixture::new();
-    fs::write(
-        fixture.dir.join("common-functions"),
-        r#"
-load_config() {
-    ESP_PATH="$TEST_ROOT/boot"
-    ENABLE_UKI="no"
-    CUSTOM_UKI_NAME="arch-linux_1"
-    MKINITCPIO_FALLBACK="no"
-}
-check_boot_partition() { return 0; }
-is_uefi() { return 1; }
-is_sb_installed() { return 1; }
-is_snapper_installed() { return 1; }
-"#,
-    )
-    .unwrap();
-    success(&fixture.run(false));
+    setup_uki_only_boot(&fixture, MACHINE);
+    let install = fixture.run_options(
+        false,
+        "DP-1",
+        &[
+            ("TEST_UKI", "yes"),
+            ("TEST_CUSTOM_UKI_NAME", "arch-linux_1"),
+        ],
+    );
+    success(&install);
+    assert!(
+        String::from_utf8_lossy(&install.stderr).contains("Ignoring invalid CUSTOM_UKI_NAME"),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(
+        fixture
+            .dir
+            .join(format!("boot/EFI/Linux/{MACHINE}_linux-test.efi"))
+            .is_file()
+    );
+    assert!(
+        fixture
+            .dir
+            .join("boot/drmcru-recovery/0-00000000000000000000000000000000_linux-test.efi")
+            .is_file()
+    );
+    success(&fixture.run_options(
+        true,
+        "DP-1",
+        &[
+            ("TEST_UKI", "yes"),
+            ("TEST_CUSTOM_UKI_NAME", "arch-linux_1"),
+        ],
+    ));
+
+    // Valid lowercase alphanumeric CUSTOM_UKI_NAME: used directly by Limine and drmcru.
+    let fixture = ScriptFixture::new();
+    setup_uki_only_boot(&fixture, "omarchy");
+    success(&fixture.run_options(
+        false,
+        "DP-1",
+        &[("TEST_UKI", "yes"), ("TEST_CUSTOM_UKI_NAME", "omarchy")],
+    ));
+    assert!(
+        fixture
+            .dir
+            .join("boot/EFI/Linux/omarchy_linux-test.efi")
+            .is_file()
+    );
+    assert!(
+        fixture
+            .dir
+            .join("boot/drmcru-recovery/0-omarchy_linux-test.efi")
+            .is_file()
+    );
+    success(&fixture.run_options(
+        true,
+        "DP-1",
+        &[("TEST_UKI", "yes"), ("TEST_CUSTOM_UKI_NAME", "omarchy")],
+    ));
+
+    // Uppercase hex MACHINE_ID with no CUSTOM_UKI_NAME is preserved without rejection.
+    let upper_id = "0123456789ABCDEF0123456789ABCDEF";
+    let fixture = ScriptFixture::new();
+    fs::write(fixture.dir.join("machine-id"), format!("{upper_id}\n")).unwrap();
+    setup_uki_only_boot(&fixture, upper_id);
+    success(&fixture.run_options(false, "DP-1", &[("TEST_UKI", "yes")]));
+    assert!(
+        fixture
+            .dir
+            .join(format!("boot/EFI/Linux/{upper_id}_linux-test.efi"))
+            .is_file()
+    );
 }
 
 #[test]
